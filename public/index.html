@@ -247,7 +247,7 @@ async function extractItemsFromText(text, hint){
   });
   const data=await resp.json();
   if(!resp.ok) throw new Error(data.error||('Server error '+resp.status));
-  return data.items;
+  return data; // {items, provider}
 }
 async function marketCheckItem(text, materialCode){
   const resp=await fetch('/api/market-check',{
@@ -470,10 +470,10 @@ async function runExtraction(){
   if(!raw){ status.textContent='Paste or extract quotation text first.'; return; }
   status.textContent='Extracting line items…';
   try{
-    const parsed=await extractItemsFromText(raw, hint);
+    const {items:parsed, provider}=await extractItemsFromText(raw, hint);
     if(!Array.isArray(parsed) || !parsed.length) throw new Error('No items found in response.');
     renderExtractReview(parsed);
-    status.textContent=`Extracted ${parsed.length} line item(s) — review below before adding.`;
+    status.textContent=`Extracted ${parsed.length} line item(s)${provider==='groq'?' (via Groq fallback — Gemini was rate-limited)':''} — review below before adding.`;
   }catch(e){
     status.textContent='Extraction failed — add items manually above, or check the text pasted in is complete. ('+e.message+')';
   }
@@ -624,20 +624,28 @@ document.getElementById('analyzeBtn').addEventListener('click', ()=>{
     }
 
     const mcId='mc-'+idx;
+    const manualId='manual-'+idx;
     html+=`<div class="sec-label">External market check (unverified — not part of the verdict above)</div>
-      <button class="ghost" id="btn-${mcId}">Search live market price</button>
-      <div id="${mcId}" style="margin-top:8px;"></div>`;
+      <div class="row">
+        <button class="ghost" id="btn-${mcId}">Search live market price</button>
+        <button class="ghost" id="btn-copy-${manualId}">Copy prompt for manual AI search (unlimited)</button>
+      </div>
+      <div id="${mcId}" style="margin-top:8px;"></div>
+      <div id="${manualId}" style="margin-top:8px;"></div>`;
 
     card.innerHTML=html;
     results.appendChild(card);
     document.getElementById(`btn-${mcId}`).addEventListener('click', ()=>checkMarketPrice(item, document.getElementById(mcId), document.getElementById(`btn-${mcId}`)));
+    document.getElementById(`btn-copy-${manualId}`).addEventListener('click', ()=>copyManualPrompt(item, document.getElementById(manualId)));
   });
 });
 
 // ---------------- external market price check (AI web search, via backend) ----------------
 function renderMarketCheck(data){
-  const { priceFindings, altSuppliers, average, hsCodeFindings } = data;
+  const { priceFindings, altSuppliers, average, hsCodeFindings, provider } = data;
   let html='';
+  if(provider==='groq') html+='<div class="note" style="margin-bottom:8px;">Answered via Groq fallback — Gemini was rate-limited.</div>';
+  if(provider==='manual') html+='<div class="note" style="margin-bottom:8px;">Parsed from a manually pasted AI response (no server API used).</div>';
 
   html+='<div class="sec-label" style="margin-top:0;">Open market price — by source</div>';
   if(priceFindings && priceFindings.length){
@@ -694,6 +702,92 @@ async function checkMarketPrice(item, container, btn){
   }finally{
     btn.disabled=false; btn.textContent='Search again';
   }
+}
+
+// ---------------- manual copy-paste search (uses YOUR OWN AI chat account — no server key, no shared quota) ----------------
+function buildManualPrompt(item){
+  const itemLabel=item.materialCode?`${item.text} (reference code ${item.materialCode})`:item.text;
+  return `Search the web for this procurement item: "${itemLabel}".
+
+Find: 1) current market price(s) from different sources, 2) alternate suppliers (manufacturer first, then distributor/trader — for branded products name the actual brand-owning manufacturer if identifiable, not just resellers), 3) the Pakistan Customs HS/PCT code for this item (current PCT 2026-27 edition if possible) — but only include a code whose product category actually matches this item; do not give a code from an unrelated category.
+
+Respond in EXACTLY this plain text format, nothing else, one entry per line (repeat each line type as many times as you have findings, use literal "NONE" line if nothing found for a section):
+PRICE: source name | price number only | currency code | url
+SUPPLIER: manufacturer or distributor or trader | company name | website | region | availability
+HSCODE: code | short description | source name | url
+NONE: PRICE  (only if you found zero prices)
+NONE: SUPPLIER  (only if you found zero suppliers)
+NONE: HSCODE  (only if you found zero HS codes)`;
+}
+
+async function copyManualPrompt(item, container){
+  const prompt=buildManualPrompt(item);
+  try{
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      await navigator.clipboard.writeText(prompt);
+    } else {
+      const ta=document.createElement('textarea');
+      ta.value=prompt; ta.style.position='fixed'; ta.style.opacity='0';
+      document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+    }
+    renderManualPasteBox(container, true);
+  }catch(e){
+    renderManualPasteBox(container, false, prompt);
+  }
+}
+
+function renderManualPasteBox(container, copiedOk, fallbackPromptText){
+  container.innerHTML = `
+    ${copiedOk
+      ? `<div class="note">Prompt copied — paste it into Claude, ChatGPT, or any AI chat with web search enabled, run it, then paste the reply below.</div>`
+      : `<div class="note">Couldn't auto-copy — select and copy this prompt manually, paste into any AI chat with web search, then paste the reply below.</div><textarea readonly style="width:100%;height:80px;font-family:var(--mono);font-size:11px;margin-top:6px;">${escapeHtml(fallbackPromptText||'')}</textarea>`}
+    <textarea id="manualPasteArea" placeholder="Paste the AI's reply here" style="width:100%;height:100px;font-family:var(--mono);font-size:11px;margin-top:8px;"></textarea>
+    <button class="primary" id="manualParseBtn" style="margin-top:8px;">Parse pasted reply</button>
+    <div id="manualParseResult" style="margin-top:8px;"></div>`;
+  document.getElementById('manualParseBtn').addEventListener('click', ()=>{
+    const text=document.getElementById('manualPasteArea').value.trim();
+    const resultEl=document.getElementById('manualParseResult');
+    if(!text){ resultEl.innerHTML='<div class="warn-box">Paste the AI\'s reply first.</div>'; return; }
+    try{
+      const data=parseManualAIResponse(text);
+      resultEl.innerHTML=renderMarketCheck(data);
+    }catch(e){
+      resultEl.innerHTML=`<div class="warn-box">Could not parse that reply — make sure the AI followed the PRICE:/SUPPLIER:/HSCODE: line format. (${escapeHtml(e.message)})</div>`;
+    }
+  });
+}
+
+function parseManualAIResponse(text){
+  const priceFindings=[], altSuppliers=[], hsCodeFindings=[];
+  text.split('\n').forEach(line=>{
+    line=line.trim();
+    if(!line) return;
+    const m=line.match(/^([A-Z]+):\s*(.*)$/);
+    if(!m) return;
+    const tag=m[1], rest=m[2];
+    if(tag==='NONE') return;
+    const parts=rest.split('|').map(p=>p.trim());
+    if(tag==='PRICE' && parts.length>=1){
+      const price=parseFloat((parts[1]||'').replace(/[^0-9.\-]/g,''));
+      priceFindings.push({source:parts[0]||'—', price:isNaN(price)?null:price, currency:parts[2]||'', url:parts[3]||'', note:''});
+    } else if(tag==='SUPPLIER' && parts.length>=1){
+      altSuppliers.push({type:(parts[0]||'').toLowerCase(), company:parts[1]||'—', website:parts[2]||'', region:parts[3]||'', availability:parts[4]||''});
+    } else if(tag==='HSCODE' && parts.length>=1){
+      hsCodeFindings.push({code:parts[0]||'', description:parts[1]||'', source:parts[2]||'', url:parts[3]||''});
+    }
+  });
+  const TYPE_ORDER={manufacturer:0,distributor:1,trader:2};
+  altSuppliers.sort((a,b)=>(TYPE_ORDER[a.type]??3)-(TYPE_ORDER[b.type]??3));
+  const byCurrency={};
+  priceFindings.forEach(p=>{ if(p.price!=null && p.currency){ (byCurrency[p.currency]=byCurrency[p.currency]||[]).push(p.price); } });
+  let average=null;
+  const currencies=Object.keys(byCurrency).sort((a,b)=>byCurrency[b].length-byCurrency[a].length);
+  if(currencies.length){
+    const top=currencies[0], vals=byCurrency[top];
+    average={value:vals.reduce((a,b)=>a+b,0)/vals.length, currency:top, count:vals.length};
+  }
+  if(!priceFindings.length && !altSuppliers.length && !hsCodeFindings.length) throw new Error('No PRICE:/SUPPLIER:/HSCODE: lines recognized in that text.');
+  return {priceFindings, altSuppliers, average, hsCodeFindings, provider:'manual'};
 }
 
 // attempt auto-restore on load
