@@ -8,6 +8,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
+const GROQ_API_KEY = process.env.GROQ_API_KEY; // optional — used as a fallback when Gemini's daily/per-minute limit is hit
 // Try the primary model; if it's been retired (404), automatically fall back to the next one.
 const MODEL_CANDIDATES = ['gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-2.5-flash'];
 if (!GEMINI_API_KEY) {
@@ -15,6 +16,9 @@ if (!GEMINI_API_KEY) {
 }
 if (!TAVILY_API_KEY) {
   console.warn('WARNING: TAVILY_API_KEY is not set. Live market search will fail until it is.');
+}
+if (!GROQ_API_KEY) {
+  console.warn('NOTE: GROQ_API_KEY is not set — no fallback provider if Gemini hits its rate limit. Optional but recommended.');
 }
 
 async function tavilySearch(query, maxResults) {
@@ -62,18 +66,77 @@ async function callGeminiOnce(model, { prompt, tools, responseSchema, maxOutputT
   return resp.json();
 }
 
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function friendlyErrorMessage(e) {
+  if (e.status === 429) {
+    return 'Rate limit reached on the free Gemini tier (shared across everyone using this tool today). This usually clears within a minute — try again shortly. If it keeps happening throughout the day, the daily free quota is exhausted and won\'t reset until midnight Pacific Time; ask your admin about enabling billing for higher limits.';
+  }
+  return e.message;
+}
+
 async function callGemini(args) {
   let lastErr;
   for (const model of MODEL_CANDIDATES) {
-    try {
-      return await callGeminiOnce(model, args);
-    } catch (e) {
-      lastErr = e;
-      if (e.status === 404) continue; // this model is retired/unavailable, try the next one
-      throw e; // any other error (bad key, quota, etc.) — no point trying other models
+    // Try this model, with one short-wait retry if we get rate-limited (429) — that's often a
+    // transient per-minute burst, not the daily cap, and a brief pause frequently clears it.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await callGeminiOnce(model, args);
+      } catch (e) {
+        lastErr = e;
+        if (e.status === 429 && attempt === 0) { await sleep(4000); continue; }
+        if (e.status === 404) break; // this model is retired/unavailable, try the next one in the outer loop
+        throw e; // any other error (bad key, still 429 after retry, etc.) — no point trying more
+      }
     }
   }
   throw lastErr;
+}
+
+// Groq — separate free-tier quota from Google's, used only as a fallback when Gemini is rate-limited.
+// Groq has no schema-enforcement param, so the caller must describe the expected JSON shape in the prompt text.
+async function callGroq(promptWithJsonInstructions, maxOutputTokens) {
+  const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_API_KEY}` },
+    body: JSON.stringify({
+      model: 'llama-3.3-70b-versatile',
+      messages: [{ role: 'user', content: promptWithJsonInstructions }],
+      response_format: { type: 'json_object' },
+      max_tokens: maxOutputTokens || 2048
+    })
+  });
+  if (!resp.ok) {
+    const t = await resp.text();
+    const err = new Error(`Groq API error ${resp.status}: ${t.slice(0, 300)}`);
+    err.status = resp.status;
+    throw err;
+  }
+  const data = await resp.json();
+  const text = data.choices && data.choices[0] && data.choices[0].message ? data.choices[0].message.content : '';
+  return text || '';
+}
+
+// Top-level dispatcher: try Gemini (schema-enforced, better quality); if it's rate-limited and Groq
+// is configured, fall back to Groq (separate quota, needs the JSON shape spelled out in the prompt text).
+async function callAIStructured({ geminiPrompt, groqPrompt, responseSchema, maxOutputTokens }) {
+  try {
+    const data = await callGemini({ prompt: geminiPrompt, responseSchema, maxOutputTokens });
+    const candidate = (data.candidates || [])[0];
+    let rawOut = geminiText(data).trim();
+    if (candidate && candidate.finishReason === 'MAX_TOKENS') {
+      const retryData = await callGemini({ prompt: geminiPrompt, responseSchema, maxOutputTokens: (maxOutputTokens || 2048) * 2 });
+      rawOut = geminiText(retryData).trim();
+    }
+    return { raw: rawOut, provider: 'gemini' };
+  } catch (e) {
+    if (e.status === 429 && GROQ_API_KEY) {
+      const raw = await callGroq(groqPrompt, maxOutputTokens);
+      return { raw, provider: 'groq' };
+    }
+    throw e;
+  }
 }
 
 function geminiText(data) {
@@ -115,20 +178,15 @@ It may contain anywhere from 1 to 30+ line items — extract EVERY genuine item 
         required: ['description', 'price']
       }
     };
+    const groqPrompt = prompt + `\n\nRespond with ONLY a JSON object of the exact shape {"items": [ {"description": string, "materialCode": string, "supplier": string, "currency": string, "price": number}, ... ]} — no markdown, no explanation, valid JSON only.`;
 
-    const data = await callGemini({ prompt, responseSchema: schema, maxOutputTokens: 4096 });
-    const candidate = (data.candidates || [])[0];
-    let out = geminiText(data).trim();
-    if (candidate && candidate.finishReason === 'MAX_TOKENS') {
-      // Ran out of room (very large quotation) — retry once with a bigger budget instead of returning broken JSON.
-      const retryData = await callGemini({ prompt, responseSchema: schema, maxOutputTokens: 8192 });
-      out = geminiText(retryData).trim();
-    }
-    const parsed = JSON.parse(out);
+    const { raw, provider } = await callAIStructured({ geminiPrompt: prompt, groqPrompt, responseSchema: schema, maxOutputTokens: 4096 });
+    const parsedRaw = JSON.parse(raw);
+    const parsed = provider === 'groq' ? (parsedRaw.items || []) : parsedRaw;
     if (!Array.isArray(parsed) || !parsed.length) throw new Error('No items found in response.');
-    res.json({ items: parsed });
+    res.json({ items: parsed, provider });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(e.status===429?429:500).json({ error: friendlyErrorMessage(e) });
   }
 });
 
@@ -217,15 +275,11 @@ CRITICAL SANITY CHECK before including any code: Pakistan's HS/PCT chapters are 
       required: ['priceFindings', 'altSuppliers', 'hsCodeFindings']
     };
 
-    const data = await callGemini({ prompt, responseSchema: schema, maxOutputTokens: 4096 });
-    const candidate = (data.candidates || [])[0];
-    let rawOut = geminiText(data).trim();
-    if (candidate && candidate.finishReason === 'MAX_TOKENS') {
-      // Still ran out of room even at 4096 — retry once with a bigger budget rather than surfacing a parse error.
-      const retryData = await callGemini({ prompt, responseSchema: schema, maxOutputTokens: 8192 });
-      rawOut = geminiText(retryData).trim();
-    }
-    const parsed = JSON.parse(rawOut);
+    const groqPrompt = prompt + `\n\nRespond with ONLY a JSON object of this exact shape — no markdown, no explanation, valid JSON only:
+{"priceFindings": [{"source": string, "url": string, "price": number, "currency": string, "note": string}], "altSuppliers": [{"company": string, "website": string, "type": string, "region": string, "availability": string}], "hsCodeFindings": [{"code": string, "description": string, "source": string, "url": string, "note": string}]}`;
+
+    const { raw, provider } = await callAIStructured({ geminiPrompt: prompt, groqPrompt, responseSchema: schema, maxOutputTokens: 4096 });
+    const parsed = JSON.parse(raw);
     const priceFindings = Array.isArray(parsed.priceFindings) ? parsed.priceFindings : [];
     const hsCodeFindings = Array.isArray(parsed.hsCodeFindings) ? parsed.hsCodeFindings : [];
     const TYPE_ORDER = { manufacturer: 0, distributor: 1, trader: 2 };
@@ -247,13 +301,13 @@ CRITICAL SANITY CHECK before including any code: Pakistan's HS/PCT chapters are 
       average = { value: vals.reduce((a, b) => a + b, 0) / vals.length, currency: top, count: vals.length };
     }
 
-    res.json({ priceFindings, altSuppliers, average, hsCodeFindings });
+    res.json({ priceFindings, altSuppliers, average, hsCodeFindings, provider });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(e.status===429?429:500).json({ error: friendlyErrorMessage(e) });
   }
 });
 
-app.get('/api/health', (req, res) => res.json({ ok: true, geminiKeyConfigured: !!GEMINI_API_KEY, tavilyKeyConfigured: !!TAVILY_API_KEY }));
+app.get('/api/health', (req, res) => res.json({ ok: true, geminiKeyConfigured: !!GEMINI_API_KEY, tavilyKeyConfigured: !!TAVILY_API_KEY, groqKeyConfigured: !!GROQ_API_KEY }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Quotation Price Analyzer running on port ${PORT}`));
