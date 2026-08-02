@@ -210,7 +210,9 @@ app.post('/api/market-check', async (req, res) => {
       return `${label}:\n` + results.map((r, i) => `${i + 1}. ${r.title} — ${r.url}\n   ${r.content}`).join('\n');
     };
 
-    const prompt = `You are a procurement analyst reviewing real web search results for this item: "${itemLabel}". This may be an industrial/chemical/engineering component or a branded product (e.g. a chemical formulation sold under a manufacturer's brand name).
+    const prompt = `You are an experienced industrial procurement analyst reviewing real web search results for this item: "${itemLabel}".
+
+Before drawing conclusions, decide what kind of item this is, because it changes how you should interpret the results: (a) BRANDED PRODUCT — a named formulation/model owned by one company, where you should identify the actual brand-owning manufacturer, not just resellers; (b) GENERIC/CUSTOM PART — a descriptive category term with no single brand owner, where you should not invent a manufacturer and should honestly label suppliers as traders/fabricators; (c) RAW MATERIAL/COMMODITY — a bulk material traded by many producers, where known producers count as manufacturers.
 
 ${formatResults('PRICING SEARCH RESULTS', priceResults)}
 
