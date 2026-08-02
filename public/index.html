@@ -125,7 +125,7 @@
     <div class="pdf-box">
       <div class="row">
         <input type="file" id="pdfFile" accept="application/pdf">
-        <span class="note">Upload a PFI/quotation PDF — it's read automatically and only the item name + unit price are pulled out below. The full PDF text is never shown by default.</span>
+        <span class="note">Upload a PFI/quotation PDF — text is pulled out for free (no AI used). Click "Extract items with AI" below when you're ready to identify item name + unit price.</span>
       </div>
       <details id="rawTextDetails" style="margin-top:8px;">
         <summary style="cursor:pointer;font-size:12px;color:var(--text-faint);">Show/edit raw extracted text (only needed if extraction misses something)</summary>
@@ -533,7 +533,7 @@ document.getElementById('pdfFile').addEventListener('change', async e=>{
     text+=content.items.map(it=>it.str).join(' ')+'\n';
   }
   ta.value=text.trim();
-  runExtraction();
+  document.getElementById('extractStatus').textContent=`Read ${pdf.numPages} page(s) — free, no AI used yet. Click "Extract items with AI" when ready.`;
 });
 
 // ---------------- analysis ----------------
@@ -608,9 +608,11 @@ document.getElementById('analyzeBtn').addEventListener('click', ()=>{
       <div class="warn-box">No matching purchase history for this item. Do not treat this as "priced fairly" or "overpriced" — it means the data doesn't exist internally. Requires manual market check or engineering sign-off before deciding.</div>`;
     }
 
-    if(CUSTOMS.length){
+    html+=`<div class="sec-label">Last purchase vs customs record vs current quote</div>`;
+    if(!CUSTOMS.length){
+      html+=`<div class="empty">No Pakistan Customs data loaded — upload it in Section 1 ("Load Pakistan Customs data") to enable this comparison.</div>`;
+    } else {
       const cm=bestCustomsMatch(item);
-      html+=`<div class="sec-label">Last purchase vs customs record vs current quote</div>`;
       if(cm || res.stats){
         html+='<table><thead><tr><th></th><th class="num">Price</th><th>Ccy</th><th>Source / date</th></tr></thead><tbody>';
         html+=`<tr><td>Last SAP purchase</td><td class="num">${res.stats?fmtPrice(res.stats.latestPrice):'—'}</td><td>${res.stats?res.stats.currency:'—'}</td><td>${res.stats?res.stats.latestDate:'no internal record'}</td></tr>`;
@@ -711,7 +713,7 @@ function buildManualPrompt(item){
 
 Find: 1) current market price(s) from different sources, 2) alternate suppliers (manufacturer first, then distributor/trader — for branded products name the actual brand-owning manufacturer if identifiable, not just resellers), 3) the Pakistan Customs HS/PCT code for this item (current PCT 2026-27 edition if possible) — but only include a code whose product category actually matches this item; do not give a code from an unrelated category.
 
-Respond in EXACTLY this plain text format, nothing else, one entry per line (repeat each line type as many times as you have findings, use literal "NONE" line if nothing found for a section):
+Respond in EXACTLY this plain text format and NOTHING ELSE — no markdown, no bullet points, no bold/asterisks, no numbered list, no headers, no code block, no extra commentary before or after, one entry per line exactly as shown below (repeat each line type as many times as you have findings, use a literal "NONE:" line if nothing found for a section):
 PRICE: source name | price number only | currency code | url
 SUPPLIER: manufacturer or distributor or trader | company name | website | region | availability
 HSCODE: code | short description | source name | url
@@ -759,12 +761,19 @@ function renderManualPasteBox(container, copiedOk, fallbackPromptText){
 
 function parseManualAIResponse(text){
   const priceFindings=[], altSuppliers=[], hsCodeFindings=[];
-  text.split('\n').forEach(line=>{
-    line=line.trim();
+  text.split('\n').forEach(rawLine=>{
+    // Strip common AI-chat formatting: bullets/numbering, bold/italic markers, backticks/code fences, so the
+    // exact plain-text format we asked for still parses even if the AI wrapped it in markdown anyway.
+    let line=rawLine
+      .replace(/^```.*$/,'')
+      .replace(/^[\s>\-\*\u2022]+/, '')
+      .replace(/^\d+[\.\)]\s*/, '')
+      .replace(/[`*_]+/g, '')
+      .trim();
     if(!line) return;
-    const m=line.match(/^([A-Z]+):\s*(.*)$/);
+    const m=line.match(/^([A-Za-z]+)\s*:\s*(.*)$/);
     if(!m) return;
-    const tag=m[1], rest=m[2];
+    const tag=m[1].toUpperCase(), rest=m[2];
     if(tag==='NONE') return;
     const parts=rest.split('|').map(p=>p.trim());
     if(tag==='PRICE' && parts.length>=1){
