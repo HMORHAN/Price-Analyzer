@@ -117,7 +117,13 @@ It may contain anywhere from 1 to 30+ line items — extract EVERY genuine item 
     };
 
     const data = await callGemini({ prompt, responseSchema: schema, maxOutputTokens: 4096 });
-    const out = geminiText(data).trim();
+    const candidate = (data.candidates || [])[0];
+    let out = geminiText(data).trim();
+    if (candidate && candidate.finishReason === 'MAX_TOKENS') {
+      // Ran out of room (very large quotation) — retry once with a bigger budget instead of returning broken JSON.
+      const retryData = await callGemini({ prompt, responseSchema: schema, maxOutputTokens: 8192 });
+      out = geminiText(retryData).trim();
+    }
     const parsed = JSON.parse(out);
     if (!Array.isArray(parsed) || !parsed.length) throw new Error('No items found in response.');
     res.json({ items: parsed });
@@ -188,8 +194,15 @@ Using ONLY the results above (never outside knowledge, never fabricate a number)
       required: ['priceFindings', 'altSuppliers']
     };
 
-    const data = await callGemini({ prompt, responseSchema: schema, maxOutputTokens: 1500 });
-    const parsed = JSON.parse(geminiText(data).trim());
+    const data = await callGemini({ prompt, responseSchema: schema, maxOutputTokens: 4096 });
+    const candidate = (data.candidates || [])[0];
+    let rawOut = geminiText(data).trim();
+    if (candidate && candidate.finishReason === 'MAX_TOKENS') {
+      // Still ran out of room even at 4096 — retry once with a bigger budget rather than surfacing a parse error.
+      const retryData = await callGemini({ prompt, responseSchema: schema, maxOutputTokens: 8192 });
+      rawOut = geminiText(retryData).trim();
+    }
+    const parsed = JSON.parse(rawOut);
     const priceFindings = Array.isArray(parsed.priceFindings) ? parsed.priceFindings : [];
     const altSuppliers = Array.isArray(parsed.altSuppliers) ? parsed.altSuppliers : [];
 
