@@ -88,7 +88,16 @@ app.post('/api/extract', async (req, res) => {
     const { text, hint } = req.body || {};
     if (!text || !text.trim()) return res.status(400).json({ error: 'No text provided.' });
 
-    let prompt = `You are extracting line items from a supplier quotation / PFI (proforma invoice). It may contain anywhere from 1 to 30+ line items — extract EVERY item, do not stop early or summarize. For each item give: description, materialCode (empty string if none visible), supplier (empty string if not stated in this text), currency (3-letter code guessed from symbols/context, empty string if unclear), and price (the UNIT price, not line total or quantity — compute unit price = total / quantity if only a total is shown). Never invent a supplier name if one is not present in the text.`;
+    let prompt = `You are an experienced procurement specialist reading a supplier quotation / PFI (proforma invoice) to build a clean line-item register. Documents like this mix real line items with letterhead, bank details, payment terms, and boilerplate — your job is to find only the actual item rows in the pricing table and ignore everything else.
+
+For each real line item extract:
+- description: the actual material/item name as a procurement specialist would record it (skip generic table labels like "Description" itself; if the item has a part/spec number inline, keep it as part of the description).
+- materialCode: a distinct reference/part number if one is shown separately from the description ("" if none).
+- supplier: only if this specific document states who is quoting/selling ("" if not stated — never guess or reuse a name from elsewhere).
+- currency: 3-letter code inferred from symbols or context ("" if genuinely unclear).
+- price: the UNIT price specifically, not the line total. If only quantity and line total are shown, compute unit price = total ÷ quantity. If a document shows multiple price columns (e.g. list price vs net price), prefer the net/final price a buyer would actually pay.
+
+It may contain anywhere from 1 to 30+ line items — extract EVERY genuine item row, do not stop early, do not summarize, and do not include header/footer/terms text as if it were an item.`;
     if (hint && hint.trim()) prompt += `\n\nLayout guidance from the user on where to find fields in this specific document: ${hint.trim()}`;
     prompt += `\n\nText:\n${text}`;
 
@@ -126,8 +135,8 @@ app.post('/api/market-check', async (req, res) => {
 
     const itemLabel = materialCode ? `${text} (reference code ${materialCode})` : text;
     const [priceResults, supplierResults] = await Promise.all([
-      tavilySearch(`${itemLabel} price buy`, 4),
-      tavilySearch(`${itemLabel} supplier manufacturer`, 4)
+      tavilySearch(`${itemLabel} price buy`, 5),
+      tavilySearch(`${itemLabel} supplier manufacturer stock`, 5)
     ]);
 
     const formatResults = (label, results) => {
@@ -135,21 +144,71 @@ app.post('/api/market-check', async (req, res) => {
       return `${label}:\n` + results.map((r, i) => `${i + 1}. ${r.title} — ${r.url}\n   ${r.content}`).join('\n');
     };
 
-    const prompt = `You are summarizing real web search results for a procurement item: "${itemLabel}". This may be an industrial/chemical/engineering component where B2B unit pricing is rarely public — only report a price if the search results actually contain one, never estimate or fabricate.
+    const prompt = `You are a procurement analyst reviewing real web search results for this item: "${itemLabel}". This may be an industrial/chemical/engineering component where B2B unit pricing is rarely public.
 
 ${formatResults('PRICING SEARCH RESULTS', priceResults)}
 
 ${formatResults('SUPPLIER SEARCH RESULTS', supplierResults)}
 
-Based ONLY on the results above (do not use outside knowledge), respond in plain text, under 220 words, structured exactly as:
-ESTIMATE: <price/range with currency and source, drawn only from the results above, OR "No reliable public pricing found for this item.">
-SOURCES: up to 3 lines "<source name> — <finding> — <URL>" drawn from the pricing results
-ALT SUPPLIERS: up to 3 lines "<company name> — <website> — <contact if visible in the results, else 'not publicly listed'>" drawn from the supplier results, OR "No alternate suppliers found via web search — check internal SAP history instead."
-Be honest about weak or missing evidence rather than guessing.`;
+Using ONLY the results above (never outside knowledge, never fabricate a number):
+1) List every distinct source that states or implies an actual price for this item or a close match. If a result has no discoverable price, skip it — do not include it with a null price just to pad the list.
+2) List every distinct company from the supplier results that appears to sell or stock this item, noting their region/country and stock availability ONLY if the result actually says so.`;
 
-    const data = await callGemini({ prompt, maxOutputTokens: 800 });
-    const text_out = geminiText(data).trim();
-    res.json({ result: text_out || 'No response returned.' });
+    const schema = {
+      type: 'OBJECT',
+      properties: {
+        priceFindings: {
+          type: 'ARRAY',
+          items: {
+            type: 'OBJECT',
+            properties: {
+              source: { type: 'STRING' },
+              url: { type: 'STRING' },
+              price: { type: 'NUMBER' },
+              currency: { type: 'STRING' },
+              note: { type: 'STRING' }
+            },
+            required: ['source', 'url', 'price', 'currency']
+          }
+        },
+        altSuppliers: {
+          type: 'ARRAY',
+          items: {
+            type: 'OBJECT',
+            properties: {
+              company: { type: 'STRING' },
+              website: { type: 'STRING' },
+              region: { type: 'STRING' },
+              availability: { type: 'STRING' }
+            },
+            required: ['company', 'website']
+          }
+        }
+      },
+      required: ['priceFindings', 'altSuppliers']
+    };
+
+    const data = await callGemini({ prompt, responseSchema: schema, maxOutputTokens: 1500 });
+    const parsed = JSON.parse(geminiText(data).trim());
+    const priceFindings = Array.isArray(parsed.priceFindings) ? parsed.priceFindings : [];
+    const altSuppliers = Array.isArray(parsed.altSuppliers) ? parsed.altSuppliers : [];
+
+    // Compute a simple average across whichever currency has the most findings — never mix currencies into one number.
+    let average = null;
+    const byCurrency = {};
+    priceFindings.forEach(p => {
+      if (typeof p.price === 'number' && p.currency) {
+        (byCurrency[p.currency] = byCurrency[p.currency] || []).push(p.price);
+      }
+    });
+    const currencies = Object.keys(byCurrency).sort((a, b) => byCurrency[b].length - byCurrency[a].length);
+    if (currencies.length) {
+      const top = currencies[0];
+      const vals = byCurrency[top];
+      average = { value: vals.reduce((a, b) => a + b, 0) / vals.length, currency: top, count: vals.length };
+    }
+
+    res.json({ priceFindings, altSuppliers, average });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
