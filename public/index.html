@@ -501,7 +501,7 @@ document.getElementById('analyzeBtn').addEventListener('click', ()=>{
 
 // ---------------- external market price check (AI web search, via backend) ----------------
 function renderMarketCheck(data){
-  const { priceFindings, altSuppliers, average } = data;
+  const { priceFindings, altSuppliers, average, hsCodeFindings } = data;
   let html='';
 
   html+='<div class="sec-label" style="margin-top:0;">Open market price — by source</div>';
@@ -518,16 +518,31 @@ function renderMarketCheck(data){
     html+='<div class="empty">No public pricing found via web search for this item.</div>';
   }
 
-  html+='<div class="sec-label">Alternate suppliers — from web search</div>';
+  html+='<div class="sec-label">Alternate suppliers — manufacturer first, then distributors/traders</div>';
   if(altSuppliers && altSuppliers.length){
-    html+='<table><thead><tr><th>Company</th><th>Website</th><th>Region</th><th>Availability</th></tr></thead><tbody>';
+    html+='<table><thead><tr><th>Type</th><th>Company</th><th>Website</th><th>Region</th><th>Availability</th></tr></thead><tbody>';
     altSuppliers.forEach(s=>{
       const site=s.website?(/^https?:\/\//i.test(s.website)?s.website:'https://'+s.website):'';
-      html+=`<tr><td>${escapeHtml(s.company||'—')}</td><td>${site?`<a href="${escAttr(site)}" target="_blank" rel="noopener" style="color:var(--low);">${escapeHtml(s.website)}</a>`:'—'}</td><td>${escapeHtml(s.region||'—')}</td><td>${escapeHtml(s.availability||'not stated')}</td></tr>`;
+      const type=(s.type||'').toLowerCase();
+      const badgeClass=type==='manufacturer'?'certain':type==='distributor'?'likely':'weak';
+      const typeLabel=type==='manufacturer'?'Manufacturer':type==='distributor'?'Distributor':type==='trader'?'Trader':(s.type||'—');
+      html+=`<tr><td><span class="badge ${badgeClass}">${escapeHtml(typeLabel)}</span></td><td>${escapeHtml(s.company||'—')}</td><td>${site?`<a href="${escAttr(site)}" target="_blank" rel="noopener" style="color:var(--low);">${escapeHtml(s.website)}</a>`:'—'}</td><td>${escapeHtml(s.region||'—')}</td><td>${escapeHtml(s.availability||'not stated')}</td></tr>`;
     });
     html+='</tbody></table>';
   } else {
     html+='<div class="empty">No alternate suppliers found via web search — check internal SAP history instead.</div>';
+  }
+
+  html+='<div class="sec-label">Suggested Pakistan Customs HS code — from web search</div>';
+  if(hsCodeFindings && hsCodeFindings.length){
+    html+='<table><thead><tr><th>HS/PCT Code</th><th>Description</th><th>Source</th><th>Link</th></tr></thead><tbody>';
+    hsCodeFindings.forEach(h=>{
+      html+=`<tr><td class="num">${escapeHtml(h.code||'—')}</td><td>${escapeHtml(h.description||h.note||'')}</td><td>${escapeHtml(h.source||'—')}</td><td>${h.url?`<a href="${escAttr(h.url)}" target="_blank" rel="noopener" style="color:var(--low);">link</a>`:'—'}</td></tr>`;
+    });
+    html+='</tbody></table>';
+    html+='<div class="warn-box">This is a lead from web search, not a filing-ready classification — Pakistan Customs HS/PCT classification depends on exact composition, use, and packaging. Verify against the current Pakistan Customs Tariff (PCT) or with your customs agent before using it on any declaration.</div>';
+  } else {
+    html+='<div class="empty">No HS code found via web search for this item — check the Pakistan Customs Tariff (PCT) directly or consult your customs agent.</div>';
   }
 
   return html;
