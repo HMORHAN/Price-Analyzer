@@ -2,7 +2,7 @@
   "name": "quotation-price-analyzer",
   "version": "1.0.0",
   "private": true,
-  "description": "Novatex quotation price analyzer with AI-assisted extraction and live market/supplier search",
+  "description": "Novatex quotation price analyzer with AI-assisted extraction and live market/supplier search (Google Gemini)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
