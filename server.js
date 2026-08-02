@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
@@ -8,10 +7,33 @@ app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 // Try the primary model; if it's been retired (404), automatically fall back to the next one.
 const MODEL_CANDIDATES = ['gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-2.5-flash'];
 if (!GEMINI_API_KEY) {
   console.warn('WARNING: GEMINI_API_KEY is not set. AI features (extraction, market search) will fail until it is.');
+}
+if (!TAVILY_API_KEY) {
+  console.warn('WARNING: TAVILY_API_KEY is not set. Live market search will fail until it is.');
+}
+
+async function tavilySearch(query, maxResults) {
+  const resp = await fetch('https://api.tavily.com/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      api_key: TAVILY_API_KEY,
+      query,
+      search_depth: 'basic',
+      max_results: maxResults || 4
+    })
+  });
+  if (!resp.ok) {
+    const t = await resp.text();
+    throw new Error(`Tavily API error ${resp.status}: ${t.slice(0, 300)}`);
+  }
+  const data = await resp.json();
+  return (data.results || []).map(r => ({ title: r.title, url: r.url, content: (r.content || '').slice(0, 500) }));
 }
 
 async function callGeminiOnce(model, { prompt, tools, responseSchema, maxOutputTokens }) {
@@ -100,21 +122,32 @@ app.post('/api/market-check', async (req, res) => {
   try {
     const { text, materialCode } = req.body || {};
     if (!text || !text.trim()) return res.status(400).json({ error: 'No item text provided.' });
+    if (!TAVILY_API_KEY) return res.status(500).json({ error: 'TAVILY_API_KEY is not set on the server.' });
 
-    const prompt = `Search the web for two things about this procurement item: "${text}"${materialCode ? ` (reference code ${materialCode})` : ''}.
-1) Current market pricing — this may be an industrial/chemical/engineering component where B2B unit pricing is rarely published; do not fabricate a number if you cannot find one.
-2) Alternate suppliers who plausibly sell this item — real, findable companies only, never invented ones.
-Respond in plain text, under 220 words, structured exactly as:
-ESTIMATE: <price/range with currency and source, OR "No reliable public pricing found for this item.">
-SOURCES: up to 3 lines "<source name> — <finding> — <URL>"
-ALT SUPPLIERS: up to 3 lines "<company name> — <website if found> — <contact/phone/email if publicly listed, else 'not publicly listed'>", OR "No alternate suppliers found via web search — check internal SAP history instead."
+    const itemLabel = materialCode ? `${text} (reference code ${materialCode})` : text;
+    const [priceResults, supplierResults] = await Promise.all([
+      tavilySearch(`${itemLabel} price buy`, 4),
+      tavilySearch(`${itemLabel} supplier manufacturer`, 4)
+    ]);
+
+    const formatResults = (label, results) => {
+      if (!results.length) return `${label}: no results.`;
+      return `${label}:\n` + results.map((r, i) => `${i + 1}. ${r.title} — ${r.url}\n   ${r.content}`).join('\n');
+    };
+
+    const prompt = `You are summarizing real web search results for a procurement item: "${itemLabel}". This may be an industrial/chemical/engineering component where B2B unit pricing is rarely public — only report a price if the search results actually contain one, never estimate or fabricate.
+
+${formatResults('PRICING SEARCH RESULTS', priceResults)}
+
+${formatResults('SUPPLIER SEARCH RESULTS', supplierResults)}
+
+Based ONLY on the results above (do not use outside knowledge), respond in plain text, under 220 words, structured exactly as:
+ESTIMATE: <price/range with currency and source, drawn only from the results above, OR "No reliable public pricing found for this item.">
+SOURCES: up to 3 lines "<source name> — <finding> — <URL>" drawn from the pricing results
+ALT SUPPLIERS: up to 3 lines "<company name> — <website> — <contact if visible in the results, else 'not publicly listed'>" drawn from the supplier results, OR "No alternate suppliers found via web search — check internal SAP history instead."
 Be honest about weak or missing evidence rather than guessing.`;
 
-    const data = await callGemini({
-      prompt,
-      tools: [{ google_search: {} }],
-      maxOutputTokens: 1500
-    });
+    const data = await callGemini({ prompt, maxOutputTokens: 800 });
     const text_out = geminiText(data).trim();
     res.json({ result: text_out || 'No response returned.' });
   } catch (e) {
@@ -122,7 +155,7 @@ Be honest about weak or missing evidence rather than guessing.`;
   }
 });
 
-app.get('/api/health', (req, res) => res.json({ ok: true, keyConfigured: !!GEMINI_API_KEY }));
+app.get('/api/health', (req, res) => res.json({ ok: true, geminiKeyConfigured: !!GEMINI_API_KEY, tavilyKeyConfigured: !!TAVILY_API_KEY }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Quotation Price Analyzer running on port ${PORT}`));
