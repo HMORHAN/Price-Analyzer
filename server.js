@@ -140,9 +140,11 @@ app.post('/api/market-check', async (req, res) => {
     if (!TAVILY_API_KEY) return res.status(500).json({ error: 'TAVILY_API_KEY is not set on the server.' });
 
     const itemLabel = materialCode ? `${text} (reference code ${materialCode})` : text;
-    const [priceResults, supplierResults] = await Promise.all([
+    const [priceResults, manufacturerResults, traderResults, hsResults] = await Promise.all([
       tavilySearch(`${itemLabel} price buy`, 5),
-      tavilySearch(`${itemLabel} supplier manufacturer stock`, 5)
+      tavilySearch(`${itemLabel} manufacturer official brand`, 5),
+      tavilySearch(`${itemLabel} distributor dealer supplier`, 5),
+      tavilySearch(`${itemLabel} HS code Pakistan customs PCT`, 5)
     ]);
 
     const formatResults = (label, results) => {
@@ -150,15 +152,20 @@ app.post('/api/market-check', async (req, res) => {
       return `${label}:\n` + results.map((r, i) => `${i + 1}. ${r.title} — ${r.url}\n   ${r.content}`).join('\n');
     };
 
-    const prompt = `You are a procurement analyst reviewing real web search results for this item: "${itemLabel}". This may be an industrial/chemical/engineering component where B2B unit pricing is rarely public.
+    const prompt = `You are a procurement analyst reviewing real web search results for this item: "${itemLabel}". This may be an industrial/chemical/engineering component or a branded product (e.g. a chemical formulation sold under a manufacturer's brand name).
 
 ${formatResults('PRICING SEARCH RESULTS', priceResults)}
 
-${formatResults('SUPPLIER SEARCH RESULTS', supplierResults)}
+${formatResults('MANUFACTURER/BRAND SEARCH RESULTS', manufacturerResults)}
 
-Using ONLY the results above (never outside knowledge, never fabricate a number):
+${formatResults('DISTRIBUTOR/TRADER SEARCH RESULTS', traderResults)}
+
+${formatResults('HS CODE SEARCH RESULTS', hsResults)}
+
+Using ONLY the results above (never outside knowledge, never fabricate a number or a company):
 1) List every distinct source that states or implies an actual price for this item or a close match. If a result has no discoverable price, skip it — do not include it with a null price just to pad the list.
-2) List every distinct company from the supplier results that appears to sell or stock this item, noting their region/country and stock availability ONLY if the result actually says so.`;
+2) List every distinct company across ALL the search results above that appears to sell, stock, distribute, or manufacture this item. For each one, classify "type" as exactly one of: "manufacturer" (the actual brand owner / original maker of this item — e.g. if the item is a branded product like a named chemical formulation, the company that owns that brand), "distributor" (an authorized regional distributor/dealer), or "trader" (a general reseller/trading company with no stated manufacturer or distributor relationship). Note their region/country and stock availability ONLY if the result actually says so. Prioritize finding the actual manufacturer if the item name suggests a branded product — a manufacturer entry is more valuable to a buyer than a generic trader and should not be omitted in favor of traders if the manufacturer is identifiable from the results.
+3) From the HS CODE SEARCH RESULTS only, list any Pakistan Customs HS/PCT code(s) mentioned for this item or its general product category (e.g. "3402.20", "8-digit PCT code"). If the results give a code for a close category rather than this exact item, include it but say so in the note. If no HS code appears anywhere in the results, return an empty list — do not guess or infer a code from general HS knowledge not present in the results.`;
 
     const schema = {
       type: 'OBJECT',
@@ -184,14 +191,29 @@ Using ONLY the results above (never outside knowledge, never fabricate a number)
             properties: {
               company: { type: 'STRING' },
               website: { type: 'STRING' },
+              type: { type: 'STRING' },
               region: { type: 'STRING' },
               availability: { type: 'STRING' }
             },
-            required: ['company', 'website']
+            required: ['company', 'website', 'type']
+          }
+        },
+        hsCodeFindings: {
+          type: 'ARRAY',
+          items: {
+            type: 'OBJECT',
+            properties: {
+              code: { type: 'STRING' },
+              description: { type: 'STRING' },
+              source: { type: 'STRING' },
+              url: { type: 'STRING' },
+              note: { type: 'STRING' }
+            },
+            required: ['code', 'source', 'url']
           }
         }
       },
-      required: ['priceFindings', 'altSuppliers']
+      required: ['priceFindings', 'altSuppliers', 'hsCodeFindings']
     };
 
     const data = await callGemini({ prompt, responseSchema: schema, maxOutputTokens: 4096 });
@@ -204,7 +226,10 @@ Using ONLY the results above (never outside knowledge, never fabricate a number)
     }
     const parsed = JSON.parse(rawOut);
     const priceFindings = Array.isArray(parsed.priceFindings) ? parsed.priceFindings : [];
-    const altSuppliers = Array.isArray(parsed.altSuppliers) ? parsed.altSuppliers : [];
+    const hsCodeFindings = Array.isArray(parsed.hsCodeFindings) ? parsed.hsCodeFindings : [];
+    const TYPE_ORDER = { manufacturer: 0, distributor: 1, trader: 2 };
+    const altSuppliers = (Array.isArray(parsed.altSuppliers) ? parsed.altSuppliers : [])
+      .sort((a, b) => (TYPE_ORDER[(a.type || '').toLowerCase()] ?? 3) - (TYPE_ORDER[(b.type || '').toLowerCase()] ?? 3));
 
     // Compute a simple average across whichever currency has the most findings — never mix currencies into one number.
     let average = null;
@@ -221,7 +246,7 @@ Using ONLY the results above (never outside knowledge, never fabricate a number)
       average = { value: vals.reduce((a, b) => a + b, 0) / vals.length, currency: top, count: vals.length };
     }
 
-    res.json({ priceFindings, altSuppliers, average });
+    res.json({ priceFindings, altSuppliers, average, hsCodeFindings });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
