@@ -27,8 +27,13 @@
     padding:3px 8px;border-radius:3px;border:1px solid currentColor;}
   section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px;margin-bottom:16px;}
   section h2{font-family:var(--disp);font-weight:600;font-size:14px;margin:0 0 14px;color:var(--amber);
-    text-transform:uppercase;letter-spacing:0.06em;}
+    text-transform:uppercase;letter-spacing:0.06em;display:flex;align-items:center;gap:10px;}
+  .step-num{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;width:22px;height:22px;
+    border-radius:50%;background:var(--amber);color:#241a06;font-family:var(--mono);font-weight:700;font-size:12px;}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
+  .summary-dash{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px;margin-bottom:18px;}
+  .summary-dash .stat{text-align:center;padding:12px 8px;}
+  .summary-dash .stat .v{font-size:20px;margin-top:4px;}
   input,select,textarea,button{font-family:var(--sans);font-size:13px;background:var(--panel-2);
     border:1px solid var(--line);color:var(--text);border-radius:6px;padding:8px 10px;}
   input:focus,select:focus,textarea:focus{outline:none;border-color:var(--amber);}
@@ -45,7 +50,7 @@
     letter-spacing:0.04em;padding:6px 8px;border-bottom:1px solid var(--line);}
   td{padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top;}
   td.num,th.num{font-family:var(--mono);text-align:right;}
-  .item-form{display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr auto;gap:8px;align-items:end;}
+  .item-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;align-items:end;}
   .item-form label{display:block;font-size:11px;color:var(--text-faint);margin-bottom:4px;}
   .field{display:flex;flex-direction:column;}
   .rm{color:var(--high);cursor:pointer;font-family:var(--mono);font-size:12px;}
@@ -79,7 +84,8 @@
     padding:10px 12px;font-size:12px;margin-top:10px;}
   @media print{
     body{background:#fff;color:#000;padding:0;}
-    section:not(#resultsSection),.pdf-box,.item-form,.thresh,#extractBtn,#analyzeBtn,#saveResultsBtn,button,input,#layoutHint{display:none !important;}
+    .no-print,button,input,select{display:none !important;}
+    section{background:#fff;border:none;box-shadow:none;}
     #resultsSection{border:none;padding:0;}
     .card{background:#fff;border:1px solid #999;page-break-inside:avoid;color:#000;}
     table{color:#000;}
@@ -87,6 +93,7 @@
     td{border-bottom:1px solid #ddd;}
     a{color:#000 !important;text-decoration:underline;}
     .badge{border:1px solid #666;background:#fff !important;color:#000 !important;}
+    .stat{background:#f5f5f5;border:1px solid #ddd;}
   }
 </style>
 </head>
@@ -95,8 +102,8 @@
   <h1>Quotation price analyzer</h1>
   <p class="sub">Internal SAP purchase history first. External claims are never fabricated — no baseline means no verdict.</p>
 
-  <section>
-    <h2>1 · Load purchase history</h2>
+  <section class="no-print">
+    <h2><span class="step-num">1</span> Load purchase history</h2>
     <div class="row">
       <input type="file" id="xlsxFile" accept=".xlsx,.xls">
       <button id="loadStoredBtn" class="ghost">Use last loaded file</button>
@@ -111,8 +118,8 @@
     <div id="customsMapping" style="display:none;margin-top:10px;"></div>
   </section>
 
-  <section>
-    <h2>2 · Add quotation items</h2>
+  <section class="no-print">
+    <h2><span class="step-num">2</span> Add quotation items</h2>
     <div class="item-form">
       <div class="field"><label>Description</label><input id="f-text" placeholder="e.g. O Ring Cylinder Head P#300805"></div>
       <div class="field"><label>Material code (optional)</label><input id="f-mat" placeholder="e.g. 270046043"></div>
@@ -149,8 +156,8 @@
   </section>
 
   <section>
-    <h2>3 · Analyze</h2>
-    <div class="thresh">
+    <h2><span class="step-num">3</span> Analyze</h2>
+    <div class="thresh no-print">
       <label style="font-size:12px;color:var(--text-dim);">Review threshold</label>
       <input type="range" id="threshold" min="5" max="100" value="20" step="5">
       <span id="threshVal" style="font-family:var(--mono);font-size:13px;">20%</span>
@@ -262,40 +269,65 @@ async function marketCheckItem(text, materialCode){
 // ---------------- history loading ----------------
 function parseWorkbook(ab){
   const wb=XLSX.read(ab,{type:'array',cellDates:true});
-  if(!wb.SheetNames.includes('Data')){
-    document.getElementById('loadStatus').textContent='No "Data" tab found in this file. Expected an SAP export with a Data tab.';
+  const sheetName=wb.SheetNames.includes('Data')?'Data':wb.SheetNames[0];
+  const ws=wb.Sheets[sheetName];
+  const allRows=XLSX.utils.sheet_to_json(ws,{header:1,raw:true,defval:null});
+  if(!allRows.length){
+    document.getElementById('loadStatus').textContent='Could not read any rows from this file.';
     return;
   }
-  const ws=wb.Sheets['Data'];
-  const rows=XLSX.utils.sheet_to_json(ws,{header:1,range:1,raw:true,defval:null}); // header row 2 (0-idx 1)
-  const headers=rows[0];
-  function firstIdx(name){return headers.indexOf(name);}
+
+  // Find the real header row by scanning the first several rows for one containing the two
+  // fields this tool always keys off: "Short Text" (material name) and "Net Price" (unit price).
+  // This avoids assuming a fixed row offset, since different SAP exports put headers on different rows.
+  let headerRowIdx=-1, headers=null;
+  const norm=s=>(s==null?'':String(s).trim().toLowerCase());
+  for(let i=0;i<Math.min(10,allRows.length);i++){
+    const row=allRows[i]||[];
+    const normed=row.map(norm);
+    if(normed.includes('short text') && normed.includes('net price')){
+      headerRowIdx=i; headers=row; break;
+    }
+  }
+  if(headerRowIdx===-1){
+    document.getElementById('loadStatus').textContent='Could not find a header row containing "Short Text" and "Net Price" in the first 10 rows of the "'+sheetName+'" tab. Check the file layout.';
+    return;
+  }
+
+  function firstIdx(name){
+    const target=norm(name);
+    return headers.findIndex(h=>norm(h)===target);
+  }
   const idx={material:firstIdx('Material'),text:firstIdx('Short Text'),plant:firstIdx('Plant'),
     supplier:firstIdx('Name of Supplier'),price:firstIdx('Net Price'),currency:firstIdx('Currency'),
     date:firstIdx('Document Date'),matgroup:firstIdx('Material Group'),segment:firstIdx('Segments')};
-  const missing=Object.entries(idx).filter(([k,v])=>v===-1).map(([k])=>k);
+  // Material name and unit price always come from these two columns specifically, per the established
+  // logic for this file type — everything else is optional context if present.
+  const missing=[];
+  if(idx.text===-1) missing.push('Short Text (material name)');
+  if(idx.price===-1) missing.push('Net Price (unit price)');
   if(missing.length){
-    document.getElementById('loadStatus').textContent='Missing expected columns: '+missing.join(', ')+'. Check the Data tab headers.';
+    document.getElementById('loadStatus').textContent='Missing required column(s): '+missing.join(', ')+'. Check the "'+sheetName+'" tab headers.';
     return;
   }
   const out=[];
-  for(let i=1;i<rows.length;i++){
-    const r=rows[i];
-    if(!r||!r[idx.material]) continue;
-    let d=r[idx.date];
+  for(let i=headerRowIdx+1;i<allRows.length;i++){
+    const r=allRows[i];
+    if(!r || r[idx.text]==null || r[idx.text]==='') continue;
+    let d=idx.date>=0?r[idx.date]:null;
     let dateStr='';
     if(d instanceof Date) dateStr=d.toISOString().slice(0,10);
     else if(typeof d==='string') dateStr=d.slice(0,10);
     out.push({
-      material:String(r[idx.material]),
-      text:r[idx.text]||'',
-      plant:r[idx.plant]?String(r[idx.plant]):'',
-      supplier:(r[idx.supplier]||'').toString().trim(),
-      price:Number(r[idx.price])||0,
-      currency:r[idx.currency]||'',
-      date:dateStr,
-      matgroup:r[idx.matgroup]||'',
-      segment:r[idx.segment]||''
+      material: idx.material>=0 && r[idx.material]!=null ? String(r[idx.material]) : '',
+      text: String(r[idx.text]),
+      plant: idx.plant>=0 && r[idx.plant]!=null ? String(r[idx.plant]) : '',
+      supplier: idx.supplier>=0 ? (r[idx.supplier]||'').toString().trim() : '',
+      price: idx.price>=0 ? (Number(r[idx.price])||0) : 0,
+      currency: idx.currency>=0 ? (r[idx.currency]||'') : '',
+      date: dateStr,
+      matgroup: idx.matgroup>=0 ? (r[idx.matgroup]||'') : '',
+      segment: idx.segment>=0 ? (r[idx.segment]||'') : ''
     });
   }
   HISTORY=out;
@@ -352,7 +384,7 @@ function renderCustomsMapping(headers){
     {key:'currency',label:'Currency column (optional)',required:false},
     {key:'date',label:'Date column (optional)',required:false}
   ];
-  let html='<div class="sec-label" style="margin-top:0;">Map your customs file columns</div><div class="item-form" style="grid-template-columns:repeat(5,1fr);">';
+  let html='<div class="sec-label" style="margin-top:0;">Map your customs file columns</div><div class="item-form">';
   fields.forEach(f=>{
     html+=`<div class="field"><label>${escapeHtml(f.label)}</label><select id="map-${f.key}">`;
     html+=`<option value="-1">${f.required?'— select —':'(none)'}</option>`;
@@ -559,10 +591,15 @@ document.getElementById('analyzeBtn').addEventListener('click', ()=>{
     return;
   }
   const threshold=Number(document.getElementById('threshold').value);
+  const counts={ok:0,high:0,low:0,noBaseline:0};
   ITEMS.forEach((item,idx)=>{
     const res=buildAnalysis(item,HISTORY);
     const verdict=verdictLabel(res,threshold);
     const badgeClass=res.tier==='Certain'?'certain':res.tier==='Likely'?'likely':res.tier==='No internal baseline'?'none':'weak';
+    if(!res.stats) counts.noBaseline++;
+    else if(verdict.className==='flag-high') counts.high++;
+    else if(verdict.className==='flag-low') counts.low++;
+    else counts.ok++;
 
     const card=document.createElement('div');
     card.className='card';
@@ -640,6 +677,16 @@ document.getElementById('analyzeBtn').addEventListener('click', ()=>{
     document.getElementById(`btn-${mcId}`).addEventListener('click', ()=>checkMarketPrice(item, document.getElementById(mcId), document.getElementById(`btn-${mcId}`)));
     document.getElementById(`btn-copy-${manualId}`).addEventListener('click', ()=>copyManualPrompt(item, document.getElementById(manualId)));
   });
+
+  const dash=document.createElement('div');
+  dash.className='summary-dash';
+  dash.innerHTML=`
+    <div class="stat"><div class="l">Items analyzed</div><div class="v">${ITEMS.length}</div></div>
+    <div class="stat"><div class="l" style="color:var(--ok);">Within threshold</div><div class="v" style="color:var(--ok);">${counts.ok}</div></div>
+    <div class="stat"><div class="l" style="color:var(--high);">Flagged high</div><div class="v" style="color:var(--high);">${counts.high}</div></div>
+    <div class="stat"><div class="l" style="color:var(--low);">Flagged low</div><div class="v" style="color:var(--low);">${counts.low}</div></div>
+    <div class="stat"><div class="l" style="color:var(--none);">No baseline</div><div class="v" style="color:var(--none);">${counts.noBaseline}</div></div>`;
+  results.prepend(dash);
 });
 
 // ---------------- external market price check (AI web search, via backend) ----------------
@@ -709,9 +756,19 @@ async function checkMarketPrice(item, container, btn){
 // ---------------- manual copy-paste search (uses YOUR OWN AI chat account — no server key, no shared quota) ----------------
 function buildManualPrompt(item){
   const itemLabel=item.materialCode?`${item.text} (reference code ${item.materialCode})`:item.text;
-  return `Search the web for this procurement item: "${itemLabel}".
+  return `Act as an experienced industrial procurement analyst researching this item: "${itemLabel}".
 
-Find: 1) current market price(s) from different sources, 2) alternate suppliers (manufacturer first, then distributor/trader — for branded products name the actual brand-owning manufacturer if identifiable, not just resellers), 3) the Pakistan Customs HS/PCT code for this item (current PCT 2026-27 edition if possible) — but only include a code whose product category actually matches this item; do not give a code from an unrelated category.
+STEP 1 — Before searching, decide what kind of item this is, because it changes your search strategy:
+(a) BRANDED PRODUCT — a named formulation, model, or product line owned by one company (e.g. a chemical trade name, a machine model). If so, find the actual brand-owning manufacturer, not just resellers.
+(b) GENERIC/CUSTOM PART — a descriptive term for a category of part or component with no single brand owner (e.g. a generic spare part, a custom-fabricated component). If so, do not invent a "manufacturer" — list real fabricators/traders who supply this category, honestly labeled as traders/distributors, and say in the note that this is a generic item type.
+(c) RAW MATERIAL/COMMODITY — a bulk chemical or material traded by many producers. If so, list known producers/major suppliers as manufacturers where identifiable.
+
+STEP 2 — Search the web and find:
+1) Current market price(s) from different real sources. Only include a price if a source actually states one — never estimate, average, or infer a price that isn't explicitly shown. Note the pricing basis if stated (per kg, per unit, per litre, MOQ, etc.) in the note field.
+2) Alternate suppliers, manufacturer first per the STEP 1 classification, then distributor/trader. Only real, findable companies — never invented ones. Note region and stock availability only if a source actually states it.
+3) The Pakistan Customs HS/PCT code, preferring the current PCT 2026-27 edition if a source shows it, otherwise note whichever edition/year the source is from. CRITICAL SANITY CHECK: Pakistan's HS/PCT chapters are broad categories (e.g. Ch 28-29 = chemicals, Ch 39 = plastics, Ch 72-73 = iron/steel, Ch 84-85 = machinery/electrical, Ch 50-63 = textiles). The chapter (first 2 digits) MUST plausibly match what this item actually is — if a result's code belongs to a clearly unrelated category, do not include it; that's a mismatched search result, not a real classification. If no chapter-consistent code appears in your results, report NONE rather than guessing.
+
+Be honest about weak or missing evidence throughout — an honest "NONE" is far more useful to a buyer than a fabricated number or a mismatched code.
 
 Respond in EXACTLY this plain text format and NOTHING ELSE — no markdown, no bullet points, no bold/asterisks, no numbered list, no headers, no code block, no extra commentary before or after, one entry per line exactly as shown below (repeat each line type as many times as you have findings, use a literal "NONE:" line if nothing found for a section):
 PRICE: source name | price number only | currency code | url
