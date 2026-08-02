@@ -77,6 +77,17 @@
   .note{font-size:12px;color:var(--text-faint);line-height:1.5;margin-top:6px;}
   .warn-box{background:var(--none-bg);border:1px solid var(--none);color:#E0C888;border-radius:6px;
     padding:10px 12px;font-size:12px;margin-top:10px;}
+  @media print{
+    body{background:#fff;color:#000;padding:0;}
+    section:not(#resultsSection),.pdf-box,.item-form,.thresh,#extractBtn,#analyzeBtn,#saveResultsBtn,button,input,#layoutHint{display:none !important;}
+    #resultsSection{border:none;padding:0;}
+    .card{background:#fff;border:1px solid #999;page-break-inside:avoid;color:#000;}
+    table{color:#000;}
+    th{color:#333;border-bottom:1px solid #999;}
+    td{border-bottom:1px solid #ddd;}
+    a{color:#000 !important;text-decoration:underline;}
+    .badge{border:1px solid #666;background:#fff !important;color:#000 !important;}
+  }
 </style>
 </head>
 <body>
@@ -91,6 +102,13 @@
       <button id="loadStoredBtn" class="ghost">Use last loaded file</button>
     </div>
     <div class="status" id="loadStatus">No history loaded yet.</div>
+
+    <div class="row" style="margin-top:16px;">
+      <input type="file" id="customsFile" accept=".xlsx,.xls">
+      <span class="note">Optional — Pakistan Customs import data (any column layout). Compared against SAP history + current quoted price per item below.</span>
+    </div>
+    <div class="status" id="customsStatus">No customs data loaded yet.</div>
+    <div id="customsMapping" style="display:none;margin-top:10px;"></div>
   </section>
 
   <section>
@@ -139,7 +157,10 @@
       <span class="note">— deviation from last internal price that triggers a flag. This is your policy call, not a default to trust blindly.</span>
     </div>
     <button class="primary" id="analyzeBtn">Run analysis</button>
-    <div id="results" style="margin-top:18px;"></div>
+    <button class="ghost" id="saveResultsBtn">Save results as PDF</button>
+    <div id="resultsSection">
+      <div id="results" style="margin-top:18px;"></div>
+    </div>
   </section>
 </div>
 
@@ -211,6 +232,7 @@ function verdictLabel(result, thresholdPct){
 // ---------------- state ----------------
 let HISTORY=[];
 let ITEMS=[];
+let CUSTOMS=[];
 
 function fmtPrice(n){return Number(n).toLocaleString(undefined,{maximumFractionDigits:2});}
 function escapeHtml(s){return (s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
@@ -293,6 +315,98 @@ document.getElementById('xlsxFile').addEventListener('change', e=>{
   reader.onload=ev=>parseWorkbook(ev.target.result);
   reader.readAsArrayBuffer(f);
 });
+
+// ---------------- Pakistan Customs data (flexible column mapping) ----------------
+let __customsRawRows=null;
+
+document.getElementById('customsFile').addEventListener('change', e=>{
+  const f=e.target.files[0]; if(!f) return;
+  const reader=new FileReader();
+  reader.onload=ev=>parseCustomsWorkbook(ev.target.result);
+  reader.readAsArrayBuffer(f);
+});
+
+function parseCustomsWorkbook(ab){
+  const status=document.getElementById('customsStatus');
+  try{
+    const wb=XLSX.read(ab,{type:'array',cellDates:true});
+    const ws=wb.Sheets[wb.SheetNames[0]];
+    const rows=XLSX.utils.sheet_to_json(ws,{header:1,raw:true,defval:null});
+    if(!rows.length){ status.textContent='Could not read any rows from this file.'; return; }
+    __customsRawRows=rows;
+    const headers=rows[0].map((h,i)=>h==null||h===''?'Column '+(i+1):String(h));
+    renderCustomsMapping(headers);
+    status.textContent=`Found ${rows.length-1} row(s), ${headers.length} column(s) — map the columns below, then click "Load customs data".`;
+  }catch(e){
+    status.textContent='Could not read this file as an Excel workbook. ('+e.message+')';
+  }
+}
+
+function renderCustomsMapping(headers){
+  const wrap=document.getElementById('customsMapping');
+  wrap.style.display='block';
+  const fields=[
+    {key:'description',label:'Item description column',required:true},
+    {key:'hsCode',label:'HS code column (optional)',required:false},
+    {key:'price',label:'Unit price column',required:true},
+    {key:'currency',label:'Currency column (optional)',required:false},
+    {key:'date',label:'Date column (optional)',required:false}
+  ];
+  let html='<div class="sec-label" style="margin-top:0;">Map your customs file columns</div><div class="item-form" style="grid-template-columns:repeat(5,1fr);">';
+  fields.forEach(f=>{
+    html+=`<div class="field"><label>${escapeHtml(f.label)}</label><select id="map-${f.key}">`;
+    html+=`<option value="-1">${f.required?'— select —':'(none)'}</option>`;
+    headers.forEach((h,i)=>{ html+=`<option value="${i}">${escapeHtml(h)}</option>`; });
+    html+='</select></div>';
+  });
+  html+='</div><button class="primary" id="confirmCustomsMapBtn" style="margin-top:10px;">Load customs data</button>';
+  wrap.innerHTML=html;
+  document.getElementById('confirmCustomsMapBtn').addEventListener('click', confirmCustomsMapping);
+}
+
+function confirmCustomsMapping(){
+  const status=document.getElementById('customsStatus');
+  const rows=__customsRawRows;
+  if(!rows){ status.textContent='Upload a customs file first.'; return; }
+  const idx=k=>Number(document.getElementById('map-'+k).value);
+  const dIdx=idx('description'), pIdx=idx('price'), hIdx=idx('hsCode'), cIdx=idx('currency'), dtIdx=idx('date');
+  if(dIdx<0 || pIdx<0){ alert('Item description column and Unit price column are both required.'); return; }
+  const out=[];
+  for(let i=1;i<rows.length;i++){
+    const r=rows[i]; if(!r) continue;
+    const desc=r[dIdx]; const price=Number(r[pIdx]);
+    if(!desc || isNaN(price)) continue;
+    let dateStr='';
+    if(dtIdx>=0 && r[dtIdx]!=null){
+      const d=r[dtIdx];
+      dateStr = d instanceof Date ? d.toISOString().slice(0,10) : String(d).slice(0,10);
+    }
+    out.push({
+      description:String(desc),
+      hsCode: hIdx>=0 && r[hIdx]!=null ? String(r[hIdx]) : '',
+      price,
+      currency: cIdx>=0 && r[cIdx]!=null ? String(r[cIdx]) : '',
+      date: dateStr
+    });
+  }
+  if(!out.length){ status.textContent='No usable rows found — check the description and price column selections.'; return; }
+  CUSTOMS=out;
+  try{ localStorage.setItem('pk-customs-data', JSON.stringify(out)); }catch(e){}
+  status.className='status good';
+  status.textContent=`Loaded ${out.length} customs record(s).`;
+  document.getElementById('customsMapping').style.display='none';
+}
+
+function bestCustomsMatch(item){
+  if(!CUSTOMS.length) return null;
+  let best=null, bestScore=0;
+  CUSTOMS.forEach(c=>{
+    const score=jaccard(item.text, c.description);
+    if(score>bestScore){ bestScore=score; best=c; }
+  });
+  if(!best || bestScore<0.3) return null;
+  return Object.assign({}, best, {score:bestScore});
+}
 
 document.getElementById('loadStoredBtn').addEventListener('click', ()=>{
   const el=document.getElementById('loadStatus');
@@ -427,6 +541,12 @@ document.getElementById('threshold').addEventListener('input', e=>{
   document.getElementById('threshVal').textContent=e.target.value+'%';
 });
 
+document.getElementById('saveResultsBtn').addEventListener('click', ()=>{
+  const results=document.getElementById('results');
+  if(!results.children.length){ alert('Run analysis first — nothing to save yet.'); return; }
+  window.print();
+});
+
 document.getElementById('analyzeBtn').addEventListener('click', ()=>{
   const results=document.getElementById('results');
   results.innerHTML='';
@@ -486,6 +606,21 @@ document.getElementById('analyzeBtn').addEventListener('click', ()=>{
     } else {
       html+=`<div class="verdict-line flag-none">No internal baseline — verdict withheld</div>
       <div class="warn-box">No matching purchase history for this item. Do not treat this as "priced fairly" or "overpriced" — it means the data doesn't exist internally. Requires manual market check or engineering sign-off before deciding.</div>`;
+    }
+
+    if(CUSTOMS.length){
+      const cm=bestCustomsMatch(item);
+      html+=`<div class="sec-label">Last purchase vs customs record vs current quote</div>`;
+      if(cm || res.stats){
+        html+='<table><thead><tr><th></th><th class="num">Price</th><th>Ccy</th><th>Source / date</th></tr></thead><tbody>';
+        html+=`<tr><td>Last SAP purchase</td><td class="num">${res.stats?fmtPrice(res.stats.latestPrice):'—'}</td><td>${res.stats?res.stats.currency:'—'}</td><td>${res.stats?res.stats.latestDate:'no internal record'}</td></tr>`;
+        html+=`<tr><td>Customs record (matched)</td><td class="num">${cm?fmtPrice(cm.price):'—'}</td><td>${cm?(cm.currency||'—'):'—'}</td><td>${cm?(cm.date||'—')+(cm.hsCode?' · HS '+escapeHtml(cm.hsCode):''):'no match found'}</td></tr>`;
+        html+=`<tr><td>Current quoted price</td><td class="num">${fmtPrice(item.price)}</td><td>${item.currency}</td><td>this quotation</td></tr>`;
+        html+='</tbody></table>';
+        if(cm) html+=`<div class="note">Customs match: "${escapeHtml(cm.description)}" (text similarity ${(cm.score*100).toFixed(0)}%) — verify this is genuinely the same item before relying on it.</div>`;
+      } else {
+        html+=`<div class="empty">No matching record found in loaded customs data for this item, and no internal SAP baseline either.</div>`;
+      }
     }
 
     const mcId='mc-'+idx;
@@ -571,6 +706,15 @@ async function checkMarketPrice(item, container, btn){
       el.className='status good';
       const materials=new Set(HISTORY.map(r=>r.material));
       el.textContent=`Restored ${HISTORY.length} records from last session (${materials.size} materials). Upload a new file to refresh.`;
+    }
+  }catch(e){}
+  try{
+    const rawC=localStorage.getItem('pk-customs-data');
+    if(rawC){
+      CUSTOMS=JSON.parse(rawC);
+      const elC=document.getElementById('customsStatus');
+      elC.className='status good';
+      elC.textContent=`Restored ${CUSTOMS.length} customs record(s) from last session. Upload a new file to refresh.`;
     }
   }catch(e){}
 })();
