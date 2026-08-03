@@ -92,14 +92,14 @@ if (!GROQ_API_KEY) {
   console.warn('NOTE: GROQ_API_KEY is not set — no fallback provider if Gemini hits its rate limit. Optional but recommended.');
 }
 
-async function tavilySearch(query, maxResults) {
+async function tavilySearch(query, maxResults, depth) {
   const resp = await fetch('https://api.tavily.com/search', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       api_key: TAVILY_API_KEY,
       query,
-      search_depth: 'basic',
+      search_depth: depth || 'basic',
       max_results: maxResults || 4
     })
   });
@@ -108,7 +108,7 @@ async function tavilySearch(query, maxResults) {
     throw new Error(`Tavily API error ${resp.status}: ${t.slice(0, 300)}`);
   }
   const data = await resp.json();
-  return (data.results || []).map(r => ({ title: r.title, url: r.url, content: (r.content || '').slice(0, 500) }));
+  return (data.results || []).map(r => ({ title: r.title, url: r.url, content: (r.content || '').slice(0, 800) }));
 }
 
 async function callGeminiOnce(model, { prompt, tools, responseSchema, maxOutputTokens }) {
@@ -272,11 +272,12 @@ app.post('/api/market-check', async (req, res) => {
     if (!TAVILY_API_KEY) return res.status(500).json({ error: 'TAVILY_API_KEY is not set on the server.' });
 
     const itemLabel = materialCode ? `${text} (reference code ${materialCode})` : text;
-    const [priceResults, manufacturerResults, traderResults, hsResults] = await Promise.all([
+    const [priceResults, manufacturerResults, traderResults, hsResults, contactResults] = await Promise.all([
       tavilySearch(`${itemLabel} price buy`, 5),
-      tavilySearch(`${itemLabel} manufacturer official brand`, 5),
-      tavilySearch(`${itemLabel} distributor dealer supplier`, 5),
-      tavilySearch(`${itemLabel} HS code Pakistan customs tariff PCT 2026-27`, 5)
+      tavilySearch(`${itemLabel} manufacturer official brand`, 5, 'advanced'),
+      tavilySearch(`${itemLabel} distributor dealer supplier`, 5, 'advanced'),
+      tavilySearch(`${itemLabel} HS code Pakistan customs tariff PCT 2026-27`, 5),
+      tavilySearch(`${itemLabel} supplier contact email sales inquiries`, 5, 'advanced')
     ]);
 
     const formatResults = (label, results) => {
@@ -296,9 +297,11 @@ ${formatResults('DISTRIBUTOR/TRADER SEARCH RESULTS', traderResults)}
 
 ${formatResults('HS CODE SEARCH RESULTS', hsResults)}
 
+${formatResults('SUPPLIER CONTACT/EMAIL SEARCH RESULTS', contactResults)}
+
 Using ONLY the results above (never outside knowledge, never fabricate a number or a company):
 1) List every distinct source that states or implies an actual price for this item or a close match. If a result has no discoverable price, skip it — do not include it with a null price just to pad the list.
-2) List every distinct company across ALL the search results above that appears to sell, stock, distribute, or manufacture this item. For each one, classify "type" as exactly one of: "manufacturer" (the actual brand owner / original maker of this item — e.g. if the item is a branded product like a named chemical formulation, the company that owns that brand), "distributor" (an authorized regional distributor/dealer), or "trader" (a general reseller/trading company with no stated manufacturer or distributor relationship). Note their region/country and stock availability ONLY if the result actually says so. If a direct contact email address for sales/inquiries is explicitly shown in a result, include it in "email" — leave it empty if none is stated; never guess or construct an email address from a company name or domain. Prioritize finding the actual manufacturer if the item name suggests a branded product — a manufacturer entry is more valuable to a buyer than a generic trader and should not be omitted in favor of traders if the manufacturer is identifiable from the results.
+2) List every distinct company across ALL the search results above that appears to sell, stock, distribute, or manufacture this item. For each one, classify "type" as exactly one of: "manufacturer" (the actual brand owner / original maker of this item — e.g. if the item is a branded product like a named chemical formulation, the company that owns that brand), "distributor" (an authorized regional distributor/dealer), or "trader" (a general reseller/trading company with no stated manufacturer or distributor relationship). Note their region/country and stock availability ONLY if the result actually says so. For "email", actively scan the content of ALL result sets above (especially the MANUFACTURER/BRAND, DISTRIBUTOR/TRADER, and SUPPLIER CONTACT/EMAIL result sets) for a real sales/info/contact email address belonging to that specific company — company "Contact Us" and "About" pages often list one (e.g. "sales@company.com", "info@company.com"). Only use an email that is literally present in the text of a result; leave it blank if none is found — never guess, construct, or infer an email from a company name or domain (e.g. never fabricate "info@companyname.com" just because that's a common pattern). Prioritize finding the actual manufacturer if the item name suggests a branded product — a manufacturer entry is more valuable to a buyer than a generic trader and should not be omitted in favor of traders if the manufacturer is identifiable from the results.
 3) From the HS CODE SEARCH RESULTS only, list any Pakistan Customs HS/PCT code(s) mentioned for this item or its general product category. Pakistan's current tariff schedule is PCT 2026-27 (the fiscal year running July 2026–June 2027) — prefer a result stating that edition; if a result is clearly from an older edition (e.g. mentions 2023-24, 2024-25, 2025-26), still include it but say the edition/year explicitly in the note field so the user knows to double-check it.
 CRITICAL SANITY CHECK before including any code: Pakistan's HS/PCT chapters are broad product categories (e.g. Chapter 28-29 = chemicals, Chapter 39 = plastics, Chapter 72-73 = iron/steel, Chapter 84-85 = machinery/electrical, Chapter 50-63 = textiles). The chapter (first 2 digits of the code) MUST plausibly match what "${itemLabel}" actually is. If a search result's HS code belongs to a completely unrelated chapter (for example a steel-chapter code for a chemical product, or a textile-chapter code for a machine part), DO NOT include it — that is very likely a mismatched or irrelevant search result, not a real classification for this item. Only include codes whose product category is consistent with the item. If no chapter-consistent code appears anywhere in the results, return an empty list rather than including a mismatched one — do not guess or infer a code from general HS knowledge not present in the results.`;
 
