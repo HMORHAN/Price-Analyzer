@@ -1,9 +1,80 @@
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
+
+// ---------------- access control: shared password + optional license expiry ----------------
+const APP_PASSWORD = process.env.APP_PASSWORD;               // set to require a password; unset = open access
+const APP_EXPIRY = process.env.APP_EXPIRY;                   // optional, e.g. "2027-06-30" — access blocked after this date
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'); // set your own in production so sessions survive restarts
+const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+function sign(value) {
+  const h = crypto.createHmac('sha256', SESSION_SECRET).update(value).digest('hex');
+  return `${value}.${h}`;
+}
+function verifyToken(token) {
+  if (!token) return null;
+  const idx = token.lastIndexOf('.');
+  if (idx === -1) return null;
+  const value = token.slice(0, idx), sig = token.slice(idx + 1);
+  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(value).digest('hex');
+  try {
+    if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+  } catch (e) { return null; }
+  const expiryTs = Number(value);
+  if (!expiryTs || Date.now() > expiryTs) return null;
+  return true;
+}
+function parseCookies(req) {
+  const header = req.headers.cookie;
+  const out = {};
+  if (!header) return out;
+  header.split(';').forEach(pair => {
+    const idx = pair.indexOf('=');
+    if (idx === -1) return;
+    out[pair.slice(0, idx).trim()] = decodeURIComponent(pair.slice(idx + 1).trim());
+  });
+  return out;
+}
+function isLicenseExpired() {
+  if (!APP_EXPIRY) return false;
+  return new Date() > new Date(APP_EXPIRY + 'T23:59:59');
+}
+
+// License expiry check — applies even to the login page itself.
+app.use((req, res, next) => {
+  if (!isLicenseExpired()) return next();
+  if (req.path.startsWith('/api/')) return res.status(403).json({ error: "This tool's access period has expired. Contact the administrator to renew." });
+  res.status(403).send(`<html><body style="font-family:sans-serif;background:#15171B;color:#E7E8EA;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;"><div><h2>Access expired</h2><p>This tool's license period has ended.<br>Contact the administrator to renew access.</p></div></body></html>`);
+});
+
+app.post('/login', (req, res) => {
+  if (!APP_PASSWORD) return res.status(500).json({ error: 'APP_PASSWORD is not configured on the server.' });
+  const { password } = req.body || {};
+  if (password !== APP_PASSWORD) return res.status(401).json({ error: 'Incorrect password.' });
+  const token = sign(String(Date.now() + SESSION_DURATION_MS));
+  res.setHeader('Set-Cookie', `auth=${token}; HttpOnly; Path=/; Max-Age=${SESSION_DURATION_MS / 1000}; SameSite=Lax`);
+  res.json({ ok: true });
+});
+app.post('/logout', (req, res) => {
+  res.setHeader('Set-Cookie', 'auth=; HttpOnly; Path=/; Max-Age=0');
+  res.json({ ok: true });
+});
+
+// Auth gate — everything below this needs a valid session unless APP_PASSWORD is unset (open/dev mode).
+app.use((req, res, next) => {
+  if (!APP_PASSWORD) return next(); // no password configured — app stays open
+  if (req.path === '/login' || req.path === '/login.html' || req.path === '/logout') return next();
+  const cookies = parseCookies(req);
+  if (verifyToken(cookies.auth)) return next();
+  if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Not logged in. Please log in again.' });
+  return res.redirect('/login.html');
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -224,7 +295,7 @@ ${formatResults('HS CODE SEARCH RESULTS', hsResults)}
 
 Using ONLY the results above (never outside knowledge, never fabricate a number or a company):
 1) List every distinct source that states or implies an actual price for this item or a close match. If a result has no discoverable price, skip it — do not include it with a null price just to pad the list.
-2) List every distinct company across ALL the search results above that appears to sell, stock, distribute, or manufacture this item. For each one, classify "type" as exactly one of: "manufacturer" (the actual brand owner / original maker of this item — e.g. if the item is a branded product like a named chemical formulation, the company that owns that brand), "distributor" (an authorized regional distributor/dealer), or "trader" (a general reseller/trading company with no stated manufacturer or distributor relationship). Note their region/country and stock availability ONLY if the result actually says so. Prioritize finding the actual manufacturer if the item name suggests a branded product — a manufacturer entry is more valuable to a buyer than a generic trader and should not be omitted in favor of traders if the manufacturer is identifiable from the results.
+2) List every distinct company across ALL the search results above that appears to sell, stock, distribute, or manufacture this item. For each one, classify "type" as exactly one of: "manufacturer" (the actual brand owner / original maker of this item — e.g. if the item is a branded product like a named chemical formulation, the company that owns that brand), "distributor" (an authorized regional distributor/dealer), or "trader" (a general reseller/trading company with no stated manufacturer or distributor relationship). Note their region/country and stock availability ONLY if the result actually says so. If a direct contact email address for sales/inquiries is explicitly shown in a result, include it in "email" — leave it empty if none is stated; never guess or construct an email address from a company name or domain. Prioritize finding the actual manufacturer if the item name suggests a branded product — a manufacturer entry is more valuable to a buyer than a generic trader and should not be omitted in favor of traders if the manufacturer is identifiable from the results.
 3) From the HS CODE SEARCH RESULTS only, list any Pakistan Customs HS/PCT code(s) mentioned for this item or its general product category. Pakistan's current tariff schedule is PCT 2026-27 (the fiscal year running July 2026–June 2027) — prefer a result stating that edition; if a result is clearly from an older edition (e.g. mentions 2023-24, 2024-25, 2025-26), still include it but say the edition/year explicitly in the note field so the user knows to double-check it.
 CRITICAL SANITY CHECK before including any code: Pakistan's HS/PCT chapters are broad product categories (e.g. Chapter 28-29 = chemicals, Chapter 39 = plastics, Chapter 72-73 = iron/steel, Chapter 84-85 = machinery/electrical, Chapter 50-63 = textiles). The chapter (first 2 digits of the code) MUST plausibly match what "${itemLabel}" actually is. If a search result's HS code belongs to a completely unrelated chapter (for example a steel-chapter code for a chemical product, or a textile-chapter code for a machine part), DO NOT include it — that is very likely a mismatched or irrelevant search result, not a real classification for this item. Only include codes whose product category is consistent with the item. If no chapter-consistent code appears anywhere in the results, return an empty list rather than including a mismatched one — do not guess or infer a code from general HS knowledge not present in the results.`;
 
@@ -254,7 +325,8 @@ CRITICAL SANITY CHECK before including any code: Pakistan's HS/PCT chapters are 
               website: { type: 'STRING' },
               type: { type: 'STRING' },
               region: { type: 'STRING' },
-              availability: { type: 'STRING' }
+              availability: { type: 'STRING' },
+              email: { type: 'STRING' }
             },
             required: ['company', 'website', 'type']
           }
@@ -278,7 +350,7 @@ CRITICAL SANITY CHECK before including any code: Pakistan's HS/PCT chapters are 
     };
 
     const groqPrompt = prompt + `\n\nRespond with ONLY a JSON object of this exact shape — no markdown, no explanation, valid JSON only:
-{"priceFindings": [{"source": string, "url": string, "price": number, "currency": string, "note": string}], "altSuppliers": [{"company": string, "website": string, "type": string, "region": string, "availability": string}], "hsCodeFindings": [{"code": string, "description": string, "source": string, "url": string, "note": string}]}`;
+{"priceFindings": [{"source": string, "url": string, "price": number, "currency": string, "note": string}], "altSuppliers": [{"company": string, "website": string, "type": string, "region": string, "availability": string, "email": string}], "hsCodeFindings": [{"code": string, "description": string, "source": string, "url": string, "note": string}]}`;
 
     const { raw, provider } = await callAIStructured({ geminiPrompt: prompt, groqPrompt, responseSchema: schema, maxOutputTokens: 4096 });
     const parsed = JSON.parse(raw);
