@@ -80,6 +80,8 @@ app.use(express.static(path.join(__dirname, 'public')));
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY; // optional — used as a fallback when Gemini's daily/per-minute limit is hit
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY; // optional — second fallback, tried if both Gemini and Groq fail
+const EXA_API_KEY = process.env.EXA_API_KEY; // optional — search fallback, tried if Tavily fails
 // Try the primary model; if it's been retired (404), automatically fall back to the next one.
 const MODEL_CANDIDATES = ['gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-2.5-flash'];
 if (!GEMINI_API_KEY) {
@@ -90,6 +92,12 @@ if (!TAVILY_API_KEY) {
 }
 if (!GROQ_API_KEY) {
   console.warn('NOTE: GROQ_API_KEY is not set — no fallback provider if Gemini hits its rate limit. Optional but recommended.');
+}
+if (!OPENROUTER_API_KEY) {
+  console.warn('NOTE: OPENROUTER_API_KEY is not set — no second AI fallback if both Gemini and Groq fail. Optional.');
+}
+if (!EXA_API_KEY) {
+  console.warn('NOTE: EXA_API_KEY is not set — no fallback if Tavily search fails. Optional.');
 }
 
 async function tavilySearch(query, maxResults, depth) {
@@ -109,6 +117,40 @@ async function tavilySearch(query, maxResults, depth) {
   }
   const data = await resp.json();
   return (data.results || []).map(r => ({ title: r.title, url: r.url, content: (r.content || '').slice(0, 800) }));
+}
+
+async function exaSearch(query, maxResults) {
+  const resp = await fetch('https://api.exa.ai/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': EXA_API_KEY },
+    body: JSON.stringify({
+      query,
+      numResults: maxResults || 4,
+      contents: { text: { maxCharacters: 800 } }
+    })
+  });
+  if (!resp.ok) {
+    const t = await resp.text();
+    const err = new Error(`Exa API error ${resp.status}: ${t.slice(0, 300)}`);
+    err.status = resp.status;
+    throw err;
+  }
+  const data = await resp.json();
+  return (data.results || []).map(r => ({ title: r.title, url: r.url, content: (r.text || '').slice(0, 800) }));
+}
+
+// Unified search: Tavily first, Exa as an automatic fallback if Tavily fails or isn't configured.
+async function webSearch(query, maxResults, depth) {
+  if (TAVILY_API_KEY) {
+    try {
+      return await tavilySearch(query, maxResults, depth);
+    } catch (e) {
+      if (!EXA_API_KEY) throw e;
+      // fall through to Exa below
+    }
+  }
+  if (EXA_API_KEY) return await exaSearch(query, maxResults);
+  throw new Error('No search provider configured (set TAVILY_API_KEY or EXA_API_KEY).');
 }
 
 async function callGeminiOnce(model, { prompt, tools, responseSchema, maxOutputTokens }) {
@@ -192,9 +234,41 @@ async function callGroq(promptWithJsonInstructions, maxOutputTokens) {
   return text || '';
 }
 
-// Top-level dispatcher: try Gemini (schema-enforced, better quality); if it's rate-limited and Groq
-// is configured, fall back to Groq (separate quota, needs the JSON shape spelled out in the prompt text).
+// OpenRouter — third-line fallback, separate quota again. Uses the "openrouter/free" auto-router alias
+// instead of a specific model ID, since OpenRouter's free-model lineup rotates frequently and a hardcoded
+// ID risks the same "model retired" failure we hit with Gemini. Same JSON-in-prompt-text requirement as Groq.
+async function callOpenRouter(promptWithJsonInstructions, maxOutputTokens) {
+  const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+      'HTTP-Referer': 'https://analyzer.local',
+      'X-Title': 'Quotation Price Analyzer'
+    },
+    body: JSON.stringify({
+      model: 'openrouter/free',
+      messages: [{ role: 'user', content: promptWithJsonInstructions }],
+      response_format: { type: 'json_object' },
+      max_tokens: maxOutputTokens || 2048
+    })
+  });
+  if (!resp.ok) {
+    const t = await resp.text();
+    const err = new Error(`OpenRouter API error ${resp.status}: ${t.slice(0, 300)}`);
+    err.status = resp.status;
+    throw err;
+  }
+  const data = await resp.json();
+  const text = data.choices && data.choices[0] && data.choices[0].message ? data.choices[0].message.content : '';
+  return text || '';
+}
+
+// Top-level dispatcher: Gemini first (schema-enforced, best quality) → Groq → OpenRouter.
+// Falls through to the next configured provider on ANY failure at a stage, not just rate limits —
+// the goal is "when one hits its limit, the next one just works" with no manual intervention.
 async function callAIStructured({ geminiPrompt, groqPrompt, responseSchema, maxOutputTokens }) {
+  const errors = [];
   try {
     const data = await callGemini({ prompt: geminiPrompt, responseSchema, maxOutputTokens });
     const candidate = (data.candidates || [])[0];
@@ -204,13 +278,23 @@ async function callAIStructured({ geminiPrompt, groqPrompt, responseSchema, maxO
       rawOut = geminiText(retryData).trim();
     }
     return { raw: rawOut, provider: 'gemini' };
-  } catch (e) {
-    if ((e.status === 429 || e.status === 503) && GROQ_API_KEY) {
+  } catch (e) { errors.push(`gemini: ${e.message}`); }
+
+  if (GROQ_API_KEY) {
+    try {
       const raw = await callGroq(groqPrompt, maxOutputTokens);
       return { raw, provider: 'groq' };
-    }
-    throw e;
+    } catch (e) { errors.push(`groq: ${e.message}`); }
   }
+
+  if (OPENROUTER_API_KEY) {
+    try {
+      const raw = await callOpenRouter(groqPrompt, maxOutputTokens);
+      return { raw, provider: 'openrouter' };
+    } catch (e) { errors.push(`openrouter: ${e.message}`); }
+  }
+
+  throw new Error(`All configured AI providers failed — ${errors.join(' | ')}`);
 }
 
 function geminiText(data) {
@@ -256,7 +340,7 @@ It may contain anywhere from 1 to 30+ line items — extract EVERY genuine item 
 
     const { raw, provider } = await callAIStructured({ geminiPrompt: prompt, groqPrompt, responseSchema: schema, maxOutputTokens: 4096 });
     const parsedRaw = JSON.parse(raw);
-    const parsed = provider === 'groq' ? (parsedRaw.items || []) : parsedRaw;
+    const parsed = (provider === 'groq' || provider === 'openrouter') ? (parsedRaw.items || []) : parsedRaw;
     if (!Array.isArray(parsed) || !parsed.length) throw new Error('No items found in response.');
     res.json({ items: parsed, provider });
   } catch (e) {
@@ -269,15 +353,15 @@ app.post('/api/market-check', async (req, res) => {
   try {
     const { text, materialCode } = req.body || {};
     if (!text || !text.trim()) return res.status(400).json({ error: 'No item text provided.' });
-    if (!TAVILY_API_KEY) return res.status(500).json({ error: 'TAVILY_API_KEY is not set on the server.' });
+    if (!TAVILY_API_KEY && !EXA_API_KEY) return res.status(500).json({ error: 'No search provider configured (TAVILY_API_KEY or EXA_API_KEY).' });
 
     const itemLabel = materialCode ? `${text} (reference code ${materialCode})` : text;
     const [priceResults, manufacturerResults, traderResults, hsResults, contactResults] = await Promise.all([
-      tavilySearch(`${itemLabel} price buy`, 5),
-      tavilySearch(`${itemLabel} manufacturer official brand`, 5, 'advanced'),
-      tavilySearch(`${itemLabel} distributor dealer supplier`, 5, 'advanced'),
-      tavilySearch(`${itemLabel} HS code Pakistan customs tariff PCT 2026-27`, 5),
-      tavilySearch(`${itemLabel} supplier contact email sales inquiries`, 5, 'advanced')
+      webSearch(`${itemLabel} price buy`, 5),
+      webSearch(`${itemLabel} manufacturer official brand`, 5, 'advanced'),
+      webSearch(`${itemLabel} distributor dealer supplier`, 5, 'advanced'),
+      webSearch(`${itemLabel} HS code Pakistan customs tariff PCT 2026-27`, 5),
+      webSearch(`${itemLabel} supplier contact email sales inquiries`, 5, 'advanced')
     ]);
 
     const formatResults = (label, results) => {
@@ -387,7 +471,14 @@ CRITICAL SANITY CHECK before including any code: Pakistan's HS/PCT chapters are 
   }
 });
 
-app.get('/api/health', (req, res) => res.json({ ok: true, geminiKeyConfigured: !!GEMINI_API_KEY, tavilyKeyConfigured: !!TAVILY_API_KEY, groqKeyConfigured: !!GROQ_API_KEY }));
+app.get('/api/health', (req, res) => res.json({
+  ok: true,
+  geminiKeyConfigured: !!GEMINI_API_KEY,
+  tavilyKeyConfigured: !!TAVILY_API_KEY,
+  groqKeyConfigured: !!GROQ_API_KEY,
+  openrouterKeyConfigured: !!OPENROUTER_API_KEY,
+  exaKeyConfigured: !!EXA_API_KEY
+}));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Quotation Price Analyzer running on port ${PORT}`));
