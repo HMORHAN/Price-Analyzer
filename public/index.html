@@ -539,7 +539,7 @@ async function runExtraction(){
     const {items:parsed, provider}=await extractItemsFromText(raw, hint);
     if(!Array.isArray(parsed) || !parsed.length) throw new Error('No items found in response.');
     renderExtractReview(parsed);
-    status.textContent=`Extracted ${parsed.length} line item(s)${provider==='groq'?' (via Groq fallback — Gemini was rate-limited)':''} — review below before adding.`;
+    status.textContent=`Extracted ${parsed.length} line item(s)${provider==='groq'?' (via Groq fallback — Gemini was unavailable)':provider==='openrouter'?' (via OpenRouter fallback — Gemini and Groq were unavailable)':''} — review below before adding.`;
   }catch(e){
     status.textContent='Extraction failed — add items manually above, or check the text pasted in is complete. ('+e.message+')';
   }
@@ -756,7 +756,8 @@ document.getElementById('analyzeBtn').addEventListener('click', ()=>{
 function renderMarketCheck(data){
   const { priceFindings, altSuppliers, average, hsCodeFindings, provider } = data;
   let html='';
-  if(provider==='groq') html+='<div class="note" style="margin-bottom:8px;">Answered via Groq fallback — Gemini was rate-limited.</div>';
+  if(provider==='groq') html+='<div class="note" style="margin-bottom:8px;">Answered via Groq fallback — Gemini was unavailable.</div>';
+  if(provider==='openrouter') html+='<div class="note" style="margin-bottom:8px;">Answered via OpenRouter fallback — Gemini and Groq were both unavailable.</div>';
   if(provider==='manual') html+='<div class="note" style="margin-bottom:8px;">Parsed from a manually pasted AI response (no server API used).</div>';
 
   html+='<div class="sec-label" style="margin-top:0;">Open market price — by source</div>';
