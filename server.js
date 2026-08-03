@@ -80,10 +80,13 @@ app.use(express.static(path.join(__dirname, 'public')));
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY; // optional — used as a fallback when Gemini's daily/per-minute limit is hit
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY; // optional — second fallback, tried if both Gemini and Groq fail
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY; // optional — third fallback
+const CEREBRAS_API_KEY = process.env.CEREBRAS_API_KEY; // optional — fourth fallback, tried if Gemini/Groq/OpenRouter all fail
 const EXA_API_KEY = process.env.EXA_API_KEY; // optional — search fallback, tried if Tavily fails
 // Try the primary model; if it's been retired (404), automatically fall back to the next one.
 const MODEL_CANDIDATES = ['gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-2.5-flash'];
+// Cerebras deprecated llama-3.3-70b in Feb 2026 — same "hardcoded model went stale" risk as Gemini, so try a list.
+const CEREBRAS_MODEL_CANDIDATES = ['gpt-oss-120b', 'llama3.1-70b', 'llama-3.3-70b', 'llama3.1-8b'];
 if (!GEMINI_API_KEY) {
   console.warn('WARNING: GEMINI_API_KEY is not set. AI features (extraction, market search) will fail until it is.');
 }
@@ -94,7 +97,10 @@ if (!GROQ_API_KEY) {
   console.warn('NOTE: GROQ_API_KEY is not set — no fallback provider if Gemini hits its rate limit. Optional but recommended.');
 }
 if (!OPENROUTER_API_KEY) {
-  console.warn('NOTE: OPENROUTER_API_KEY is not set — no second AI fallback if both Gemini and Groq fail. Optional.');
+  console.warn('NOTE: OPENROUTER_API_KEY is not set — no third AI fallback. Optional.');
+}
+if (!CEREBRAS_API_KEY) {
+  console.warn('NOTE: CEREBRAS_API_KEY is not set — no fourth AI fallback. Optional.');
 }
 if (!EXA_API_KEY) {
   console.warn('NOTE: EXA_API_KEY is not set — no fallback if Tavily search fails. Optional.');
@@ -264,7 +270,42 @@ async function callOpenRouter(promptWithJsonInstructions, maxOutputTokens) {
   return text || '';
 }
 
-// Top-level dispatcher: Gemini first (schema-enforced, best quality) → Groq → OpenRouter.
+// Cerebras — fourth-line fallback, fastest inference of the group. Tries a short list of model
+// names in order (see CEREBRAS_MODEL_CANDIDATES) since Cerebras retires model IDs periodically —
+// same defensive pattern as the Gemini model list, to avoid a repeat of that "model retired" bug.
+async function callCerebras(promptWithJsonInstructions, maxOutputTokens) {
+  let lastErr;
+  for (const model of CEREBRAS_MODEL_CANDIDATES) {
+    try {
+      const resp = await fetch('https://api.cerebras.ai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${CEREBRAS_API_KEY}` },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: promptWithJsonInstructions }],
+          response_format: { type: 'json_object' },
+          max_tokens: maxOutputTokens || 2048
+        })
+      });
+      if (!resp.ok) {
+        const t = await resp.text();
+        const err = new Error(`Cerebras API error ${resp.status} (model ${model}): ${t.slice(0, 300)}`);
+        err.status = resp.status;
+        throw err;
+      }
+      const data = await resp.json();
+      const text = data.choices && data.choices[0] && data.choices[0].message ? data.choices[0].message.content : '';
+      return text || '';
+    } catch (e) {
+      lastErr = e;
+      if (e.status === 404 || e.status === 400) continue; // this model name is invalid/retired, try the next one
+      throw e; // any other error (bad key, quota, etc.) — no point trying other model names
+    }
+  }
+  throw lastErr;
+}
+
+// Top-level dispatcher: Gemini first (schema-enforced, best quality) → Groq → OpenRouter → Cerebras.
 // Falls through to the next configured provider on ANY failure at a stage, not just rate limits —
 // the goal is "when one hits its limit, the next one just works" with no manual intervention.
 async function callAIStructured({ geminiPrompt, groqPrompt, responseSchema, maxOutputTokens }) {
@@ -292,6 +333,13 @@ async function callAIStructured({ geminiPrompt, groqPrompt, responseSchema, maxO
       const raw = await callOpenRouter(groqPrompt, maxOutputTokens);
       return { raw, provider: 'openrouter' };
     } catch (e) { errors.push(`openrouter: ${e.message}`); }
+  }
+
+  if (CEREBRAS_API_KEY) {
+    try {
+      const raw = await callCerebras(groqPrompt, maxOutputTokens);
+      return { raw, provider: 'cerebras' };
+    } catch (e) { errors.push(`cerebras: ${e.message}`); }
   }
 
   throw new Error(`All configured AI providers failed — ${errors.join(' | ')}`);
@@ -340,7 +388,7 @@ It may contain anywhere from 1 to 30+ line items — extract EVERY genuine item 
 
     const { raw, provider } = await callAIStructured({ geminiPrompt: prompt, groqPrompt, responseSchema: schema, maxOutputTokens: 4096 });
     const parsedRaw = JSON.parse(raw);
-    const parsed = (provider === 'groq' || provider === 'openrouter') ? (parsedRaw.items || []) : parsedRaw;
+    const parsed = ['groq', 'openrouter', 'cerebras'].includes(provider) ? (parsedRaw.items || []) : parsedRaw;
     if (!Array.isArray(parsed) || !parsed.length) throw new Error('No items found in response.');
     res.json({ items: parsed, provider });
   } catch (e) {
@@ -477,6 +525,7 @@ app.get('/api/health', (req, res) => res.json({
   tavilyKeyConfigured: !!TAVILY_API_KEY,
   groqKeyConfigured: !!GROQ_API_KEY,
   openrouterKeyConfigured: !!OPENROUTER_API_KEY,
+  cerebrasKeyConfigured: !!CEREBRAS_API_KEY,
   exaKeyConfigured: !!EXA_API_KEY
 }));
 
