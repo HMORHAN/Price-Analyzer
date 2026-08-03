@@ -721,6 +721,35 @@ document.getElementById('analyzeBtn').addEventListener('click', ()=>{
     <div class="stat"><div class="l" style="color:var(--low);">Flagged low</div><div class="v" style="color:var(--low);">${counts.low}</div></div>
     <div class="stat"><div class="l" style="color:var(--none);">No baseline</div><div class="v" style="color:var(--none);">${counts.noBaseline}</div></div>`;
   results.prepend(dash);
+
+  const batchBar=document.createElement('div');
+  batchBar.className='row';
+  batchBar.style.marginBottom='16px';
+  batchBar.innerHTML=`
+    <button class="ghost" id="batchSearchBtn">Search live market price — all items</button>
+    <button class="ghost" id="batchManualBtn">Copy prompt for manual AI search — all items (unlimited)</button>
+    <span class="status" id="batchStatus"></span>
+    <div id="batchManualBox" style="display:none;width:100%;margin-top:8px;"></div>`;
+  results.insertBefore(batchBar, dash.nextSibling);
+
+  document.getElementById('batchSearchBtn').addEventListener('click', async ()=>{
+    const btn=document.getElementById('batchSearchBtn');
+    const status=document.getElementById('batchStatus');
+    btn.disabled=true;
+    for(let idx=0; idx<ITEMS.length; idx++){
+      const item=ITEMS[idx];
+      const container=document.getElementById('mc-'+idx);
+      const itemBtn=document.getElementById('btn-mc-'+idx);
+      if(!container || !itemBtn) continue;
+      status.textContent=`Searching item ${idx+1} of ${ITEMS.length}…`;
+      await checkMarketPrice(item, container, itemBtn);
+      if(idx<ITEMS.length-1) await new Promise(r=>setTimeout(r,2500)); // pace requests to stay under free-tier rate limits
+    }
+    status.textContent=`Done — searched ${ITEMS.length} item(s).`;
+    btn.disabled=false;
+  });
+
+  document.getElementById('batchManualBtn').addEventListener('click', ()=>copyBatchManualPrompt(ITEMS));
 });
 
 // ---------------- external market price check (AI web search, via backend) ----------------
@@ -841,6 +870,127 @@ async function checkMarketPrice(item, container, btn){
 }
 
 // ---------------- manual copy-paste search (uses YOUR OWN AI chat account — no server key, no shared quota) ----------------
+
+// Batch version — one prompt covering every item, so you only need one round trip to your AI chat
+// instead of one per item. Results are tagged by item number and distributed back automatically.
+function buildBatchManualPrompt(items){
+  const itemList=items.map((it,i)=>`ITEM ${i+1}: "${it.text}"${it.materialCode?` (reference code ${it.materialCode})`:''}`).join('\n');
+  return `Act as an experienced industrial procurement analyst researching MULTIPLE items in one pass:
+
+${itemList}
+
+For EACH item above, independently:
+STEP 1 — classify it as (a) BRANDED PRODUCT (find the actual brand-owning manufacturer, not just resellers), (b) GENERIC/CUSTOM PART (no single brand owner — honestly label suppliers as traders/fabricators, do not invent a manufacturer), or (c) RAW MATERIAL/COMMODITY (known producers count as manufacturers).
+STEP 2 — search the web and find: 1) current market price(s) from real sources only, never estimate or infer one; 2) alternate suppliers, manufacturer first, with a direct contact email ONLY if explicitly shown on a source (never guess or construct one — check company contact/about pages for a real sales or info email); 3) the Pakistan Customs HS/PCT code (current PCT 2026-27 edition preferred), but only if the chapter plausibly matches that item's actual category — report NONE for that item rather than a mismatched code.
+
+Be honest about weak or missing evidence — an honest NONE is more useful than a fabricated number or wrong code.
+
+Respond in EXACTLY this plain text format and NOTHING ELSE — no markdown, no bullets, no bold, no headers, no code blocks, no extra commentary, one entry per line, tagging every line with the ITEM NUMBER it belongs to (repeat lines as needed per item):
+PRICE <n>: source name | price number only | currency code | url
+SUPPLIER <n>: manufacturer or distributor or trader | company name | website | region | availability | email (blank if none found)
+HSCODE <n>: code | short description | source name | url
+NONE <n>: PRICE  (only if zero prices found for item n)
+NONE <n>: SUPPLIER  (only if zero suppliers found for item n)
+NONE <n>: HSCODE  (only if zero HS codes found for item n)
+
+Where <n> is the item number (1, 2, 3, ...) matching the ITEM list above. Cover every item — do not skip any.`;
+}
+
+async function copyBatchManualPrompt(items){
+  const prompt=buildBatchManualPrompt(items);
+  const box=document.getElementById('batchManualBox');
+  box.style.display='block';
+  try{
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      await navigator.clipboard.writeText(prompt);
+      renderBatchManualPasteBox(box, true, null, items);
+    } else {
+      throw new Error('clipboard unavailable');
+    }
+  }catch(e){
+    renderBatchManualPasteBox(box, false, prompt, items);
+  }
+}
+
+function renderBatchManualPasteBox(box, copiedOk, fallbackPromptText, items){
+  box.innerHTML=`
+    ${copiedOk
+      ? `<div class="note">Prompt copied — covers all ${items.length} item(s) in one go. Paste into Claude, ChatGPT, or any AI chat with web search, run it, then paste the reply below.</div>`
+      : `<div class="note">Couldn't auto-copy — select and copy this prompt manually, paste into any AI chat with web search, then paste the reply below.</div><textarea readonly style="width:100%;height:100px;font-family:var(--mono);font-size:11px;margin-top:6px;">${escapeHtml(fallbackPromptText||'')}</textarea>`}
+    <textarea id="batchPasteArea" placeholder="Paste the AI's reply here (covering all items)" style="width:100%;height:120px;font-family:var(--mono);font-size:11px;margin-top:8px;"></textarea>
+    <button class="primary" id="batchParseBtn" style="margin-top:8px;">Parse & distribute to each item</button>
+    <div id="batchParseStatus" class="status" style="margin-top:6px;"></div>`;
+  document.getElementById('batchParseBtn').addEventListener('click', ()=>{
+    const text=document.getElementById('batchPasteArea').value.trim();
+    const status=document.getElementById('batchParseStatus');
+    if(!text){ status.textContent="Paste the AI's reply first."; return; }
+    try{
+      const perItem=parseBatchManualAIResponse(text, items.length);
+      let filled=0;
+      perItem.forEach((data,i)=>{
+        if(!data) return;
+        const container=document.getElementById('manual-'+i);
+        if(!container) return;
+        container.innerHTML=renderMarketCheck(data);
+        attachRFQHandlers(container, data.altSuppliers, items[i]);
+        filled++;
+      });
+      status.className='status good';
+      status.textContent=`Distributed results to ${filled} of ${items.length} item(s) — scroll down to each item's card to view.`;
+    }catch(e){
+      status.textContent='Could not parse that reply — make sure the AI tagged every line with an item number, e.g. "PRICE 1: ...". ('+e.message+')';
+    }
+  });
+}
+
+function parseBatchManualAIResponse(text, itemCount){
+  const perItem=Array.from({length:itemCount}, ()=>({priceFindings:[],altSuppliers:[],hsCodeFindings:[]}));
+  let anyMatched=false;
+  text.split('\n').forEach(rawLine=>{
+    let line=rawLine
+      .replace(/^```.*$/,'')
+      .replace(/^[\s>\-\*\u2022]+/, '')
+      .replace(/^\d+[\.\)]\s*/, '')
+      .replace(/[`*_]+/g, '')
+      .trim();
+    if(!line) return;
+    const m=line.match(/^([A-Za-z]+)\s+(\d+)\s*:\s*(.*)$/);
+    if(!m) return;
+    const tag=m[1].toUpperCase(), n=Number(m[2]), rest=m[3];
+    const i=n-1;
+    if(i<0 || i>=itemCount) return;
+    if(tag==='NONE') { anyMatched=true; return; }
+    const parts=rest.split('|').map(p=>p.trim());
+    if(tag==='PRICE' && parts.length>=1){
+      const price=parseFloat((parts[1]||'').replace(/[^0-9.\-]/g,''));
+      perItem[i].priceFindings.push({source:parts[0]||'—', price:isNaN(price)?null:price, currency:parts[2]||'', url:parts[3]||'', note:''});
+      anyMatched=true;
+    } else if(tag==='SUPPLIER' && parts.length>=1){
+      perItem[i].altSuppliers.push({type:(parts[0]||'').toLowerCase(), company:parts[1]||'—', website:parts[2]||'', region:parts[3]||'', availability:parts[4]||'', email:parts[5]||''});
+      anyMatched=true;
+    } else if(tag==='HSCODE' && parts.length>=1){
+      perItem[i].hsCodeFindings.push({code:parts[0]||'', description:parts[1]||'', source:parts[2]||'', url:parts[3]||''});
+      anyMatched=true;
+    }
+  });
+  if(!anyMatched) throw new Error('No tagged PRICE/SUPPLIER/HSCODE lines recognized in that text.');
+  const TYPE_ORDER={manufacturer:0,distributor:1,trader:2};
+  return perItem.map(d=>{
+    d.altSuppliers.sort((a,b)=>(TYPE_ORDER[a.type]??3)-(TYPE_ORDER[b.type]??3));
+    const byCurrency={};
+    d.priceFindings.forEach(p=>{ if(p.price!=null && p.currency){ (byCurrency[p.currency]=byCurrency[p.currency]||[]).push(p.price); } });
+    let average=null;
+    const currencies=Object.keys(byCurrency).sort((a,b)=>byCurrency[b].length-byCurrency[a].length);
+    if(currencies.length){
+      const top=currencies[0], vals=byCurrency[top];
+      average={value:vals.reduce((a,b)=>a+b,0)/vals.length, currency:top, count:vals.length};
+    }
+    d.average=average;
+    d.provider='manual';
+    return d;
+  });
+}
+
 function buildManualPrompt(item){
   const itemLabel=item.materialCode?`${item.text} (reference code ${item.materialCode})`:item.text;
   return `Act as an experienced industrial procurement analyst researching this item: "${itemLabel}".
