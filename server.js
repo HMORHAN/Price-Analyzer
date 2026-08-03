@@ -159,6 +159,57 @@ async function webSearch(query, maxResults, depth) {
   throw new Error('No search provider configured (set TAVILY_API_KEY or EXA_API_KEY).');
 }
 
+// ---------------- targeted supplier contact lookup (no AI call — direct regex extraction from real page text) ----------------
+const EMAIL_RE = /[a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}/g;
+const JUNK_TLDS = new Set(['png','jpg','jpeg','gif','svg','webp','ico','css','js']);
+const JUNK_DOMAINS = ['example.com', 'domain.com', 'yourdomain.com', 'email.com', 'yoursite.com', 'sentry.io', 'wixpress.com'];
+const PHONE_RE = /(\+?\d[\d\-\.\s()]{7,}\d)/g;
+
+function extractDomain(website) {
+  if (!website) return '';
+  return website.replace(/^https?:\/\//i, '').replace(/^www\./i, '').split('/')[0].toLowerCase();
+}
+
+function pickBestEmail(text, preferredDomain) {
+  const matches = (text.match(EMAIL_RE) || []).filter(e => {
+    const tld = e.split('.').pop().toLowerCase();
+    if (JUNK_TLDS.has(tld)) return false;
+    const domain = e.split('@')[1].toLowerCase();
+    if (JUNK_DOMAINS.some(j => domain.includes(j))) return false;
+    return true;
+  });
+  if (!matches.length) return '';
+  if (preferredDomain) {
+    const onDomain = matches.find(e => e.split('@')[1].toLowerCase().includes(preferredDomain));
+    if (onDomain) return onDomain;
+  }
+  return matches[0];
+}
+
+function pickBestPhone(text) {
+  const matches = (text.match(PHONE_RE) || []).filter(p => {
+    const digits = p.replace(/\D/g, '');
+    return digits.length >= 8 && digits.length <= 15; // plausible phone number length, filters out stray numbers/years
+  });
+  return matches[0] ? matches[0].trim() : '';
+}
+
+// For the top few suppliers missing an email/phone, search their actual company name (not the item)
+// specifically for contact details, then pull a real email/phone directly out of the returned page text.
+async function enrichSupplierContacts(altSuppliers) {
+  const targets = altSuppliers.filter(s => s.company && (!s.email || !s.phone)).slice(0, 3);
+  await Promise.all(targets.map(async (s) => {
+    try {
+      const results = await webSearch(`"${s.company}" contact email phone`, 3, 'advanced');
+      const combinedText = results.map(r => r.title + ' ' + r.content).join(' ');
+      const domain = extractDomain(s.website);
+      if (!s.email) s.email = pickBestEmail(combinedText, domain);
+      if (!s.phone) s.phone = pickBestPhone(combinedText);
+    } catch (e) { /* best-effort only — leave blank if this lookup fails, never block the main result */ }
+  }));
+  return altSuppliers;
+}
+
 async function callGeminiOnce(model, { prompt, tools, responseSchema, maxOutputTokens }) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
   const body = {
@@ -464,7 +515,8 @@ CRITICAL SANITY CHECK before including any code: Pakistan's HS/PCT chapters are 
               type: { type: 'STRING' },
               region: { type: 'STRING' },
               availability: { type: 'STRING' },
-              email: { type: 'STRING' }
+              email: { type: 'STRING' },
+              phone: { type: 'STRING' }
             },
             required: ['company', 'website', 'type']
           }
@@ -488,7 +540,7 @@ CRITICAL SANITY CHECK before including any code: Pakistan's HS/PCT chapters are 
     };
 
     const groqPrompt = prompt + `\n\nRespond with ONLY a JSON object of this exact shape — no markdown, no explanation, valid JSON only:
-{"priceFindings": [{"source": string, "url": string, "price": number, "currency": string, "note": string}], "altSuppliers": [{"company": string, "website": string, "type": string, "region": string, "availability": string, "email": string}], "hsCodeFindings": [{"code": string, "description": string, "source": string, "url": string, "note": string}]}`;
+{"priceFindings": [{"source": string, "url": string, "price": number, "currency": string, "note": string}], "altSuppliers": [{"company": string, "website": string, "type": string, "region": string, "availability": string, "email": string, "phone": string}], "hsCodeFindings": [{"code": string, "description": string, "source": string, "url": string, "note": string}]}`;
 
     const { raw, provider } = await callAIStructured({ geminiPrompt: prompt, groqPrompt, responseSchema: schema, maxOutputTokens: 4096 });
     const parsed = JSON.parse(raw);
@@ -497,6 +549,7 @@ CRITICAL SANITY CHECK before including any code: Pakistan's HS/PCT chapters are 
     const TYPE_ORDER = { manufacturer: 0, distributor: 1, trader: 2 };
     const altSuppliers = (Array.isArray(parsed.altSuppliers) ? parsed.altSuppliers : [])
       .sort((a, b) => (TYPE_ORDER[(a.type || '').toLowerCase()] ?? 3) - (TYPE_ORDER[(b.type || '').toLowerCase()] ?? 3));
+    await enrichSupplierContacts(altSuppliers);
 
     // Compute a simple average across whichever currency has the most findings — never mix currencies into one number.
     let average = null;
