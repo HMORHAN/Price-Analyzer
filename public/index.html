@@ -539,7 +539,7 @@ async function runExtraction(){
     const {items:parsed, provider}=await extractItemsFromText(raw, hint);
     if(!Array.isArray(parsed) || !parsed.length) throw new Error('No items found in response.');
     renderExtractReview(parsed);
-    status.textContent=`Extracted ${parsed.length} line item(s)${provider==='groq'?' (via Groq fallback — Gemini was unavailable)':provider==='openrouter'?' (via OpenRouter fallback — Gemini and Groq were unavailable)':''} — review below before adding.`;
+    status.textContent=`Extracted ${parsed.length} line item(s)${provider==='groq'?' (via Groq fallback — Gemini was unavailable)':provider==='openrouter'?' (via OpenRouter fallback — Gemini and Groq were unavailable)':provider==='cerebras'?' (via Cerebras fallback — Gemini, Groq, and OpenRouter were unavailable)':''} — review below before adding.`;
   }catch(e){
     status.textContent='Extraction failed — add items manually above, or check the text pasted in is complete. ('+e.message+')';
   }
@@ -758,6 +758,7 @@ function renderMarketCheck(data){
   let html='';
   if(provider==='groq') html+='<div class="note" style="margin-bottom:8px;">Answered via Groq fallback — Gemini was unavailable.</div>';
   if(provider==='openrouter') html+='<div class="note" style="margin-bottom:8px;">Answered via OpenRouter fallback — Gemini and Groq were both unavailable.</div>';
+  if(provider==='cerebras') html+='<div class="note" style="margin-bottom:8px;">Answered via Cerebras fallback — Gemini, Groq, and OpenRouter were all unavailable.</div>';
   if(provider==='manual') html+='<div class="note" style="margin-bottom:8px;">Parsed from a manually pasted AI response (no server API used).</div>';
 
   html+='<div class="sec-label" style="margin-top:0;">Open market price — by source</div>';
@@ -776,13 +777,13 @@ function renderMarketCheck(data){
 
   html+='<div class="sec-label">Alternate suppliers — manufacturer first, then distributors/traders</div>';
   if(altSuppliers && altSuppliers.length){
-    html+='<table><thead><tr><th>Type</th><th>Company</th><th>Website</th><th>Region</th><th>Availability</th><th>Email</th><th></th></tr></thead><tbody>';
+    html+='<table><thead><tr><th>Type</th><th>Company</th><th>Website</th><th>Region</th><th>Availability</th><th>Email</th><th>Phone</th><th></th></tr></thead><tbody>';
     altSuppliers.forEach((s,si)=>{
       const site=s.website?(/^https?:\/\//i.test(s.website)?s.website:'https://'+s.website):'';
       const type=(s.type||'').toLowerCase();
       const badgeClass=type==='manufacturer'?'certain':type==='distributor'?'likely':'weak';
       const typeLabel=type==='manufacturer'?'Manufacturer':type==='distributor'?'Distributor':type==='trader'?'Trader':(s.type||'—');
-      html+=`<tr><td><span class="badge ${badgeClass}">${escapeHtml(typeLabel)}</span></td><td>${escapeHtml(s.company||'—')}</td><td>${site?`<a href="${escAttr(site)}" target="_blank" rel="noopener" style="color:var(--low);">${escapeHtml(s.website)}</a>`:'—'}</td><td>${escapeHtml(s.region||'—')}</td><td>${escapeHtml(s.availability||'not stated')}</td><td>${escapeHtml(s.email||'—')}</td><td><a href="#" class="rfq-link" data-si="${si}" style="color:var(--amber);white-space:nowrap;">Draft RFQ</a></td></tr>`;
+      html+=`<tr><td><span class="badge ${badgeClass}">${escapeHtml(typeLabel)}</span></td><td>${escapeHtml(s.company||'—')}</td><td>${site?`<a href="${escAttr(site)}" target="_blank" rel="noopener" style="color:var(--low);">${escapeHtml(s.website)}</a>`:'—'}</td><td>${escapeHtml(s.region||'—')}</td><td>${escapeHtml(s.availability||'not stated')}</td><td>${escapeHtml(s.email||'—')}</td><td>${escapeHtml(s.phone||'—')}</td><td><a href="#" class="rfq-link" data-si="${si}" style="color:var(--amber);white-space:nowrap;">Draft RFQ</a></td></tr>`;
     });
     html+='</tbody></table>';
   } else {
@@ -833,7 +834,8 @@ function buildRFQMailto(supplier, item){
     'Best regards,',
   ];
   if(!supplier.email){
-    bodyLines.splice(2, 0, `[No email found for ${supplier.company} via search — please confirm their contact address before sending, e.g. via ${supplier.website||'their website'}.]`, '');
+    const altContact = supplier.phone ? `their phone (${supplier.phone}) or` : '';
+    bodyLines.splice(2, 0, `[No email found for ${supplier.company} via search — please confirm their contact address before sending, e.g. via ${altContact} ${supplier.website||'their website'}.]`, '');
   }
   const body = bodyLines.join('\n');
   const to = supplier.email || '';
@@ -888,7 +890,7 @@ Be honest about weak or missing evidence — an honest NONE is more useful than 
 
 Respond in EXACTLY this plain text format and NOTHING ELSE — no markdown, no bullets, no bold, no headers, no code blocks, no extra commentary, one entry per line, tagging every line with the ITEM NUMBER it belongs to (repeat lines as needed per item):
 PRICE <n>: source name | price number only | currency code | url
-SUPPLIER <n>: manufacturer or distributor or trader | company name | website | region | availability | email (blank if none found)
+SUPPLIER <n>: manufacturer or distributor or trader | company name | website | region | availability | email (blank if none found) | phone (blank if none found)
 HSCODE <n>: code | short description | source name | url
 NONE <n>: PRICE  (only if zero prices found for item n)
 NONE <n>: SUPPLIER  (only if zero suppliers found for item n)
@@ -967,7 +969,7 @@ function parseBatchManualAIResponse(text, itemCount){
       perItem[i].priceFindings.push({source:parts[0]||'—', price:isNaN(price)?null:price, currency:parts[2]||'', url:parts[3]||'', note:''});
       anyMatched=true;
     } else if(tag==='SUPPLIER' && parts.length>=1){
-      perItem[i].altSuppliers.push({type:(parts[0]||'').toLowerCase(), company:parts[1]||'—', website:parts[2]||'', region:parts[3]||'', availability:parts[4]||'', email:parts[5]||''});
+      perItem[i].altSuppliers.push({type:(parts[0]||'').toLowerCase(), company:parts[1]||'—', website:parts[2]||'', region:parts[3]||'', availability:parts[4]||'', email:parts[5]||'', phone:parts[6]||''});
       anyMatched=true;
     } else if(tag==='HSCODE' && parts.length>=1){
       perItem[i].hsCodeFindings.push({code:parts[0]||'', description:parts[1]||'', source:parts[2]||'', url:parts[3]||''});
@@ -1010,7 +1012,7 @@ Be honest about weak or missing evidence throughout — an honest "NONE" is far 
 
 Respond in EXACTLY this plain text format and NOTHING ELSE — no markdown, no bullet points, no bold/asterisks, no numbered list, no headers, no code block, no extra commentary before or after, one entry per line exactly as shown below (repeat each line type as many times as you have findings, use a literal "NONE:" line if nothing found for a section):
 PRICE: source name | price number only | currency code | url
-SUPPLIER: manufacturer or distributor or trader | company name | website | region | availability | email (blank if none found)
+SUPPLIER: manufacturer or distributor or trader | company name | website | region | availability | email (blank if none found) | phone (blank if none found)
 HSCODE: code | short description | source name | url
 NONE: PRICE  (only if you found zero prices)
 NONE: SUPPLIER  (only if you found zero suppliers)
@@ -1076,7 +1078,7 @@ function parseManualAIResponse(text){
       const price=parseFloat((parts[1]||'').replace(/[^0-9.\-]/g,''));
       priceFindings.push({source:parts[0]||'—', price:isNaN(price)?null:price, currency:parts[2]||'', url:parts[3]||'', note:''});
     } else if(tag==='SUPPLIER' && parts.length>=1){
-      altSuppliers.push({type:(parts[0]||'').toLowerCase(), company:parts[1]||'—', website:parts[2]||'', region:parts[3]||'', availability:parts[4]||'', email:parts[5]||''});
+      altSuppliers.push({type:(parts[0]||'').toLowerCase(), company:parts[1]||'—', website:parts[2]||'', region:parts[3]||'', availability:parts[4]||'', email:parts[5]||'', phone:parts[6]||''});
     } else if(tag==='HSCODE' && parts.length>=1){
       hsCodeFindings.push({code:parts[0]||'', description:parts[1]||'', source:parts[2]||'', url:parts[3]||''});
     }
