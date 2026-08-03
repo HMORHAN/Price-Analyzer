@@ -143,22 +143,25 @@ function friendlyErrorMessage(e) {
   if (e.status === 429) {
     return 'Rate limit reached on the free Gemini tier (shared across everyone using this tool today). This usually clears within a minute — try again shortly. If it keeps happening throughout the day, the daily free quota is exhausted and won\'t reset until midnight Pacific Time; ask your admin about enabling billing for higher limits.';
   }
+  if (e.status === 503) {
+    return 'Gemini is temporarily overloaded on Google\'s side (not a quota issue). This should clear within a minute — try again shortly.';
+  }
   return e.message;
 }
 
 async function callGemini(args) {
   let lastErr;
   for (const model of MODEL_CANDIDATES) {
-    // Try this model, with one short-wait retry if we get rate-limited (429) — that's often a
-    // transient per-minute burst, not the daily cap, and a brief pause frequently clears it.
+    // Try this model, with one short-wait retry if we get rate-limited (429) or the model is
+    // transiently overloaded (503) — both are usually short-lived, and a brief pause often clears them.
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         return await callGeminiOnce(model, args);
       } catch (e) {
         lastErr = e;
-        if (e.status === 429 && attempt === 0) { await sleep(4000); continue; }
+        if ((e.status === 429 || e.status === 503) && attempt === 0) { await sleep(4000); continue; }
         if (e.status === 404) break; // this model is retired/unavailable, try the next one in the outer loop
-        throw e; // any other error (bad key, still 429 after retry, etc.) — no point trying more
+        throw e; // any other error (bad key, still failing after retry, etc.) — no point trying more
       }
     }
   }
@@ -202,7 +205,7 @@ async function callAIStructured({ geminiPrompt, groqPrompt, responseSchema, maxO
     }
     return { raw: rawOut, provider: 'gemini' };
   } catch (e) {
-    if (e.status === 429 && GROQ_API_KEY) {
+    if ((e.status === 429 || e.status === 503) && GROQ_API_KEY) {
       const raw = await callGroq(groqPrompt, maxOutputTokens);
       return { raw, provider: 'groq' };
     }
