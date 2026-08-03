@@ -99,7 +99,10 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>Quotation price analyzer</h1>
+  <div class="row no-print" style="justify-content:space-between;margin-bottom:2px;">
+    <h1 style="margin-bottom:0;">Quotation price analyzer</h1>
+    <a href="#" id="logoutLink" style="color:var(--text-faint);font-size:12px;">Log out</a>
+  </div>
   <p class="sub">Internal SAP purchase history first. External claims are never fabricated — no baseline means no verdict.</p>
 
   <section class="no-print">
@@ -458,6 +461,8 @@ document.getElementById('loadStoredBtn').addEventListener('click', ()=>{
 });
 
 // ---------------- items ----------------
+let editingIndex=-1;
+
 function renderItems(){
   const tbl=document.getElementById('itemsTable');
   const body=document.getElementById('itemsBody');
@@ -466,13 +471,42 @@ function renderItems(){
   tbl.style.display='table';
   ITEMS.forEach((it,i)=>{
     const tr=document.createElement('tr');
-    tr.innerHTML=`<td>${it.text}</td><td class="num">${it.materialCode||'—'}</td><td>${it.supplier||'—'}</td>
-      <td class="num">${fmtPrice(it.price)}</td><td>${it.currency}</td>
-      <td><span class="rm" data-i="${i}">remove</span></td>`;
+    if(i===editingIndex){
+      tr.innerHTML=`<td><input id="edit-text" value="${escAttr(it.text)}" style="width:100%;"></td>
+        <td><input id="edit-mat" value="${escAttr(it.materialCode||'')}" class="num" style="width:90px;"></td>
+        <td><input id="edit-supplier" value="${escAttr(it.supplier||'')}" style="width:100px;"></td>
+        <td><input id="edit-price" type="number" step="0.01" value="${it.price}" class="num" style="width:80px;"></td>
+        <td><input id="edit-currency" value="${escAttr(it.currency)}" style="width:55px;"></td>
+        <td style="white-space:nowrap;"><span class="rm" data-save="${i}">save</span> &nbsp; <span class="rm" data-cancel="1">cancel</span></td>`;
+    } else {
+      tr.innerHTML=`<td>${escapeHtml(it.text)}</td><td class="num">${escapeHtml(it.materialCode||'—')}</td><td>${escapeHtml(it.supplier||'—')}</td>
+        <td class="num">${fmtPrice(it.price)}</td><td>${escapeHtml(it.currency)}</td>
+        <td style="white-space:nowrap;"><span class="rm" data-edit="${i}">edit</span> &nbsp; <span class="rm" data-i="${i}">remove</span></td>`;
+    }
     body.appendChild(tr);
   });
-  body.querySelectorAll('.rm').forEach(el=>el.addEventListener('click',()=>{
-    ITEMS.splice(Number(el.dataset.i),1); renderItems();
+  body.querySelectorAll('[data-i]').forEach(el=>el.addEventListener('click',()=>{
+    ITEMS.splice(Number(el.dataset.i),1); editingIndex=-1; renderItems();
+  }));
+  body.querySelectorAll('[data-edit]').forEach(el=>el.addEventListener('click',()=>{
+    editingIndex=Number(el.dataset.edit); renderItems();
+  }));
+  body.querySelectorAll('[data-cancel]').forEach(el=>el.addEventListener('click',()=>{
+    editingIndex=-1; renderItems();
+  }));
+  body.querySelectorAll('[data-save]').forEach(el=>el.addEventListener('click',()=>{
+    const i=Number(el.dataset.save);
+    const text=document.getElementById('edit-text').value.trim();
+    const price=parseFloat(document.getElementById('edit-price').value);
+    if(!text || isNaN(price)){ alert('Description and quoted price are required.'); return; }
+    ITEMS[i]={
+      text,
+      materialCode: document.getElementById('edit-mat').value.trim(),
+      supplier: document.getElementById('edit-supplier').value.trim(),
+      currency: document.getElementById('edit-currency').value.trim()||'EUR',
+      price
+    };
+    editingIndex=-1; renderItems();
   }));
 }
 
@@ -712,13 +746,13 @@ function renderMarketCheck(data){
 
   html+='<div class="sec-label">Alternate suppliers — manufacturer first, then distributors/traders</div>';
   if(altSuppliers && altSuppliers.length){
-    html+='<table><thead><tr><th>Type</th><th>Company</th><th>Website</th><th>Region</th><th>Availability</th></tr></thead><tbody>';
-    altSuppliers.forEach(s=>{
+    html+='<table><thead><tr><th>Type</th><th>Company</th><th>Website</th><th>Region</th><th>Availability</th><th>Email</th><th></th></tr></thead><tbody>';
+    altSuppliers.forEach((s,si)=>{
       const site=s.website?(/^https?:\/\//i.test(s.website)?s.website:'https://'+s.website):'';
       const type=(s.type||'').toLowerCase();
       const badgeClass=type==='manufacturer'?'certain':type==='distributor'?'likely':'weak';
       const typeLabel=type==='manufacturer'?'Manufacturer':type==='distributor'?'Distributor':type==='trader'?'Trader':(s.type||'—');
-      html+=`<tr><td><span class="badge ${badgeClass}">${escapeHtml(typeLabel)}</span></td><td>${escapeHtml(s.company||'—')}</td><td>${site?`<a href="${escAttr(site)}" target="_blank" rel="noopener" style="color:var(--low);">${escapeHtml(s.website)}</a>`:'—'}</td><td>${escapeHtml(s.region||'—')}</td><td>${escapeHtml(s.availability||'not stated')}</td></tr>`;
+      html+=`<tr><td><span class="badge ${badgeClass}">${escapeHtml(typeLabel)}</span></td><td>${escapeHtml(s.company||'—')}</td><td>${site?`<a href="${escAttr(site)}" target="_blank" rel="noopener" style="color:var(--low);">${escapeHtml(s.website)}</a>`:'—'}</td><td>${escapeHtml(s.region||'—')}</td><td>${escapeHtml(s.availability||'not stated')}</td><td>${escapeHtml(s.email||'—')}</td><td><a href="#" class="rfq-link" data-si="${si}" style="color:var(--amber);white-space:nowrap;">Draft RFQ</a></td></tr>`;
     });
     html+='</tbody></table>';
   } else {
@@ -740,12 +774,65 @@ function renderMarketCheck(data){
   return html;
 }
 
+// ---------------- RFQ draft (mailto — opens in your default mail app, e.g. Outlook, for you to review and send) ----------------
+const RFQ_CC = ['mazhar.saeed@gatron-novatex.com', 'adnanasif@gatron-novatex.com'];
+
+function buildRFQMailto(supplier, item){
+  const itemLabel = item.materialCode ? `${item.text} (Ref: ${item.materialCode})` : item.text;
+  const subject = `RFQ — ${item.text}`;
+  const bodyLines = [
+    `Dear ${supplier.company||'Sir/Madam'},`,
+    '',
+    'We would like to request your best quotation for the following item:',
+    '',
+    `Item description: ${item.text}`,
+    `Reference/Material code: ${item.materialCode || 'N/A'}`,
+    'Quantity required: [please specify]',
+    'Unit of measure: [please specify]',
+    'Delivery location: Karachi, Pakistan',
+    'Required delivery date: [please specify]',
+    '',
+    'Kindly share your quotation including:',
+    '- Unit price and total price, with currency',
+    '- Payment terms',
+    '- Lead time / delivery schedule',
+    '- Quotation validity period',
+    '',
+    'We look forward to your response.',
+    '',
+    'Best regards,',
+  ];
+  if(!supplier.email){
+    bodyLines.splice(2, 0, `[No email found for ${supplier.company} via search — please confirm their contact address before sending, e.g. via ${supplier.website||'their website'}.]`, '');
+  }
+  const body = bodyLines.join('\n');
+  const to = supplier.email || '';
+  const params = new URLSearchParams();
+  params.set('cc', RFQ_CC.join(','));
+  params.set('subject', subject);
+  params.set('body', body);
+  return `mailto:${encodeURIComponent(to)}?${params.toString().replace(/\+/g,'%20')}`;
+}
+
+function attachRFQHandlers(container, altSuppliers, item){
+  if(!altSuppliers) return;
+  container.querySelectorAll('.rfq-link').forEach(a=>{
+    a.addEventListener('click', e=>{
+      e.preventDefault();
+      const s=altSuppliers[Number(a.dataset.si)];
+      if(!s) return;
+      window.location.href=buildRFQMailto(s, item);
+    });
+  });
+}
+
 async function checkMarketPrice(item, container, btn){
   btn.disabled=true; btn.textContent='Searching…';
   container.innerHTML='<div class="note">Querying live web sources — this is external, unverified data, kept separate from the internal verdict.</div>';
   try{
     const data=await marketCheckItem(item.text, item.materialCode);
     container.innerHTML=renderMarketCheck(data);
+    attachRFQHandlers(container, data.altSuppliers, item);
   }catch(e){
     container.innerHTML=`<div class="warn-box">External check failed: ${escapeHtml(e.message)}</div>`;
   }finally{
@@ -765,14 +852,14 @@ STEP 1 — Before searching, decide what kind of item this is, because it change
 
 STEP 2 — Search the web and find:
 1) Current market price(s) from different real sources. Only include a price if a source actually states one — never estimate, average, or infer a price that isn't explicitly shown. Note the pricing basis if stated (per kg, per unit, per litre, MOQ, etc.) in the note field.
-2) Alternate suppliers, manufacturer first per the STEP 1 classification, then distributor/trader. Only real, findable companies — never invented ones. Note region and stock availability only if a source actually states it.
+2) Alternate suppliers, manufacturer first per the STEP 1 classification, then distributor/trader. Only real, findable companies — never invented ones. Note region and stock availability only if a source actually states it. Include a direct contact email ONLY if one is explicitly shown in a source — leave it blank otherwise, never guess or construct one from a company name or domain.
 3) The Pakistan Customs HS/PCT code, preferring the current PCT 2026-27 edition if a source shows it, otherwise note whichever edition/year the source is from. CRITICAL SANITY CHECK: Pakistan's HS/PCT chapters are broad categories (e.g. Ch 28-29 = chemicals, Ch 39 = plastics, Ch 72-73 = iron/steel, Ch 84-85 = machinery/electrical, Ch 50-63 = textiles). The chapter (first 2 digits) MUST plausibly match what this item actually is — if a result's code belongs to a clearly unrelated category, do not include it; that's a mismatched search result, not a real classification. If no chapter-consistent code appears in your results, report NONE rather than guessing.
 
 Be honest about weak or missing evidence throughout — an honest "NONE" is far more useful to a buyer than a fabricated number or a mismatched code.
 
 Respond in EXACTLY this plain text format and NOTHING ELSE — no markdown, no bullet points, no bold/asterisks, no numbered list, no headers, no code block, no extra commentary before or after, one entry per line exactly as shown below (repeat each line type as many times as you have findings, use a literal "NONE:" line if nothing found for a section):
 PRICE: source name | price number only | currency code | url
-SUPPLIER: manufacturer or distributor or trader | company name | website | region | availability
+SUPPLIER: manufacturer or distributor or trader | company name | website | region | availability | email (blank if none found)
 HSCODE: code | short description | source name | url
 NONE: PRICE  (only if you found zero prices)
 NONE: SUPPLIER  (only if you found zero suppliers)
@@ -789,13 +876,13 @@ async function copyManualPrompt(item, container){
       ta.value=prompt; ta.style.position='fixed'; ta.style.opacity='0';
       document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
     }
-    renderManualPasteBox(container, true);
+    renderManualPasteBox(container, true, null, item);
   }catch(e){
-    renderManualPasteBox(container, false, prompt);
+    renderManualPasteBox(container, false, prompt, item);
   }
 }
 
-function renderManualPasteBox(container, copiedOk, fallbackPromptText){
+function renderManualPasteBox(container, copiedOk, fallbackPromptText, item){
   container.innerHTML = `
     ${copiedOk
       ? `<div class="note">Prompt copied — paste it into Claude, ChatGPT, or any AI chat with web search enabled, run it, then paste the reply below.</div>`
@@ -810,6 +897,7 @@ function renderManualPasteBox(container, copiedOk, fallbackPromptText){
     try{
       const data=parseManualAIResponse(text);
       resultEl.innerHTML=renderMarketCheck(data);
+      attachRFQHandlers(resultEl, data.altSuppliers, item);
     }catch(e){
       resultEl.innerHTML=`<div class="warn-box">Could not parse that reply — make sure the AI followed the PRICE:/SUPPLIER:/HSCODE: line format. (${escapeHtml(e.message)})</div>`;
     }
@@ -837,7 +925,7 @@ function parseManualAIResponse(text){
       const price=parseFloat((parts[1]||'').replace(/[^0-9.\-]/g,''));
       priceFindings.push({source:parts[0]||'—', price:isNaN(price)?null:price, currency:parts[2]||'', url:parts[3]||'', note:''});
     } else if(tag==='SUPPLIER' && parts.length>=1){
-      altSuppliers.push({type:(parts[0]||'').toLowerCase(), company:parts[1]||'—', website:parts[2]||'', region:parts[3]||'', availability:parts[4]||''});
+      altSuppliers.push({type:(parts[0]||'').toLowerCase(), company:parts[1]||'—', website:parts[2]||'', region:parts[3]||'', availability:parts[4]||'', email:parts[5]||''});
     } else if(tag==='HSCODE' && parts.length>=1){
       hsCodeFindings.push({code:parts[0]||'', description:parts[1]||'', source:parts[2]||'', url:parts[3]||''});
     }
@@ -855,6 +943,12 @@ function parseManualAIResponse(text){
   if(!priceFindings.length && !altSuppliers.length && !hsCodeFindings.length) throw new Error('No PRICE:/SUPPLIER:/HSCODE: lines recognized in that text.');
   return {priceFindings, altSuppliers, average, hsCodeFindings, provider:'manual'};
 }
+
+document.getElementById('logoutLink').addEventListener('click', async e=>{
+  e.preventDefault();
+  try{ await fetch('/logout',{method:'POST'}); }catch(err){}
+  window.location.href='/login.html';
+});
 
 // attempt auto-restore on load
 (()=>{
