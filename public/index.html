@@ -115,6 +115,7 @@
 
     <div class="row" style="margin-top:16px;">
       <input type="file" id="customsFile" accept=".xlsx,.xls">
+      <button id="loadStoredCustomsBtn" class="ghost">Use last loaded file</button>
       <span class="note">Optional — Pakistan Customs import data (any column layout). Compared against SAP history + current quoted price per item below.</span>
     </div>
     <div class="status" id="customsStatus">No customs data loaded yet.</div>
@@ -457,6 +458,23 @@ document.getElementById('loadStoredBtn').addEventListener('click', ()=>{
     }
   }catch(e){
     el.textContent='No previously loaded file found in this browser.';
+  }
+});
+
+document.getElementById('loadStoredCustomsBtn').addEventListener('click', ()=>{
+  const el=document.getElementById('customsStatus');
+  try{
+    const raw=localStorage.getItem('pk-customs-data');
+    if(raw){
+      CUSTOMS=JSON.parse(raw);
+      el.className='status good';
+      el.textContent=`Restored ${CUSTOMS.length} customs record(s) from last session.`;
+      document.getElementById('customsMapping').style.display='none';
+    } else {
+      el.textContent='No previously loaded customs file found in this browser.';
+    }
+  }catch(e){
+    el.textContent='No previously loaded customs file found in this browser.';
   }
 });
 
@@ -809,29 +827,50 @@ function renderMarketCheck(data){
 const RFQ_CC = ['mazhar.saeed@gatron-novatex.com', 'adnanasif@gatron-novatex.com'];
 
 function buildRFQMailto(supplier, item){
-  const itemLabel = item.materialCode ? `${item.text} (Ref: ${item.materialCode})` : item.text;
   const subject = `RFQ — ${item.text}`;
   const bodyLines = [
     `Dear ${supplier.company||'Sir/Madam'},`,
     '',
-    'We would like to request your best quotation for the following item:',
+    `We would like to request your best competitive quotation for the supply of ${item.text}.`,
     '',
-    `Item description: ${item.text}`,
-    `Reference/Material code: ${item.materialCode || 'N/A'}`,
-    'Quantity required: [please specify]',
-    'Unit of measure: [please specify]',
-    'Delivery location: Karachi, Pakistan',
-    'Required delivery date: [please specify]',
+    'Please find the requirement details below:',
     '',
-    'Kindly share your quotation including:',
-    '- Unit price and total price, with currency',
-    '- Payment terms',
-    '- Lead time / delivery schedule',
-    '- Quotation validity period',
+    '1. Item Specifications & Requirement',
     '',
-    'We look forward to your response.',
+    `* Item Description: ${item.text} (Please attach Technical Data Sheet / TDS if available)`,
+    `* Reference / Material Code: ${item.materialCode || 'N/A'}`,
+    '* Quantity Required: [Insert Quantity, e.g., 5,000 kg / 10 Drums]',
+    '* Unit of Measure (UOM): [e.g., KG / Liters / Drums]',
+    '* Delivery Location: Karachi, Pakistan',
+    '* Target Delivery Date: ASAP',
     '',
-    'Best regards,',
+    '',
+    '2. Commercial & Operational Information Requested',
+    'To help us evaluate your offer efficiently, kindly ensure your quotation includes the following:',
+    '',
+    '* Pricing: Unit price and total price with currency',
+    '* Incoterms',
+    '* Payment Terms: Preferred commercial payment terms.',
+    '* Lead Time: Production and delivery timeline upon receipt of Purchase Order.',
+    '* Quotation Validity: Validity period',
+    '* Packaging Details: Standard packing size (e.g., 200kg drums, IBC tanks, bags).',
+    '',
+    '',
+    '3. Technical Documentation',
+    'Along with the commercial quote, please provide:',
+    '',
+    '* Technical Data Sheet (TDS) & Material Safety Data Sheet (MSDS)',
+    '* Certificate of Analysis (COA) / Sample specification sheet/ Catalogue',
+    '',
+    '',
+    'Kindly submit your formal quote ASAP.',
+    '',
+    'Should you require any technical clarification, feel free to contact me directly. We look forward to your prompt response.',
+    '',
+    'BR',
+    'M.Humayun Kalim',
+    'Lead Procurement',
+    'Mobile / WA : +92 320 251 7630 | (Ext) 9906',
   ];
   if(!supplier.email){
     const altContact = supplier.phone ? `their phone (${supplier.phone}) or` : '';
