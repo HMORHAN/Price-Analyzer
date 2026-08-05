@@ -4,13 +4,30 @@ const path = require('path');
 const crypto = require('crypto');
 
 const app = express();
+app.set('trust proxy', true); // required behind Render's proxy so req.ip is the real visitor IP, not Render's internal one
 app.use(express.json({ limit: '2mb' }));
 
-// ---------------- access control: shared password + optional license expiry ----------------
-const APP_PASSWORD = process.env.APP_PASSWORD;               // set to require a password; unset = open access
+// ---------------- access control: named ID+password accounts (or legacy shared password) + optional license expiry ----------------
+const APP_PASSWORD = process.env.APP_PASSWORD;               // legacy: single shared password, any ID accepted — unset = open access unless APP_USERS is set
+const APP_USERS = (process.env.APP_USERS || '')              // preferred: "id1:pass1,id2:pass2" — named accounts, each with their own password
+  .split(',').map(s => s.trim()).filter(Boolean)
+  .reduce((map, pair) => {
+    const idx = pair.indexOf(':');
+    if (idx === -1) return map;
+    map[pair.slice(0, idx)] = pair.slice(idx + 1);
+    return map;
+  }, {});
+const AUTH_REQUIRED = !!APP_PASSWORD || Object.keys(APP_USERS).length > 0;
 const APP_EXPIRY = process.env.APP_EXPIRY;                   // optional, e.g. "2027-06-30" — access blocked after this date
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'); // set your own in production so sessions survive restarts
 const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+function checkCredentials(id, password) {
+  if (!id || !password) return false;
+  if (Object.keys(APP_USERS).length > 0) return APP_USERS[id] === password; // named-account mode: id must match exactly
+  if (APP_PASSWORD) return password === APP_PASSWORD; // legacy mode: any id, shared password
+  return false;
+}
 
 function sign(value) {
   const h = crypto.createHmac('sha256', SESSION_SECRET).update(value).digest('hex');
@@ -25,9 +42,10 @@ function verifyToken(token) {
   try {
     if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
   } catch (e) { return null; }
-  const expiryTs = Number(value);
+  const [expiryStr, ...idParts] = value.split('|');
+  const expiryTs = Number(expiryStr);
   if (!expiryTs || Date.now() > expiryTs) return null;
-  return true;
+  return { id: idParts.join('|') || null };
 }
 function parseCookies(req) {
   const header = req.headers.cookie;
@@ -45,6 +63,30 @@ function isLicenseExpired() {
   return new Date() > new Date(APP_EXPIRY + 'T23:59:59');
 }
 
+// ---------------- optional IP allowlist (restrict the whole tool to specific networks) ----------------
+const ALLOWED_IPS = (process.env.ALLOWED_IPS || '').split(',').map(s => s.trim()).filter(Boolean); // empty = no restriction
+
+function ipToInt(ip) {
+  const parts = ip.split('.').map(Number);
+  if (parts.length !== 4 || parts.some(n => isNaN(n) || n < 0 || n > 255)) return null;
+  return ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0;
+}
+function isIpAllowed(rawIp) {
+  if (!ALLOWED_IPS.length) return true; // no allowlist configured — open to any IP
+  const ip = (rawIp || '').replace('::ffff:', ''); // normalize IPv4-mapped IPv6 addresses
+  return ALLOWED_IPS.some(entry => {
+    if (entry.includes('/')) {
+      const [range, bitsStr] = entry.split('/');
+      const bits = Number(bitsStr);
+      const rangeInt = ipToInt(range), ipInt = ipToInt(ip);
+      if (rangeInt === null || ipInt === null || isNaN(bits)) return false;
+      const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0;
+      return (rangeInt & mask) === (ipInt & mask);
+    }
+    return entry === ip;
+  });
+}
+
 // License expiry check — applies even to the login page itself.
 app.use((req, res, next) => {
   if (!isLicenseExpired()) return next();
@@ -52,23 +94,34 @@ app.use((req, res, next) => {
   res.status(403).send(`<html><body style="font-family:sans-serif;background:#15171B;color:#E7E8EA;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;"><div><h2>Access expired</h2><p>This tool's license period has ended.<br>Contact the administrator to renew access.</p></div></body></html>`);
 });
 
+// IP allowlist check — also applies to everything, including the login page.
+app.use((req, res, next) => {
+  if (isIpAllowed(req.ip)) return next();
+  if (req.path.startsWith('/api/')) return res.status(403).json({ error: 'Access from this network is not permitted.' });
+  res.status(403).send(`<html><body style="font-family:sans-serif;background:#15171B;color:#E7E8EA;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;"><div><h2>Access restricted</h2><p>This tool is not available from your current network.<br>Contact the administrator if you believe this is an error.</p></div></body></html>`);
+});
+
 app.post('/login', (req, res) => {
-  if (!APP_PASSWORD) return res.status(500).json({ error: 'APP_PASSWORD is not configured on the server.' });
-  const { password } = req.body || {};
-  if (password !== APP_PASSWORD) return res.status(401).json({ error: 'Incorrect password.' });
-  const token = sign(String(Date.now() + SESSION_DURATION_MS));
+  if (!AUTH_REQUIRED) return res.status(500).json({ error: 'No login is configured on the server (APP_USERS or APP_PASSWORD not set).' });
+  const { id, password } = req.body || {};
+  if (!checkCredentials(id, password)) return res.status(401).json({ error: 'Incorrect ID or password.' });
+  const token = sign(`${Date.now() + SESSION_DURATION_MS}|${id}`);
   res.setHeader('Set-Cookie', `auth=${token}; HttpOnly; Path=/; Max-Age=${SESSION_DURATION_MS / 1000}; SameSite=Lax`);
-  res.json({ ok: true });
+  res.json({ ok: true, id });
 });
 app.post('/logout', (req, res) => {
   res.setHeader('Set-Cookie', 'auth=; HttpOnly; Path=/; Max-Age=0');
   res.json({ ok: true });
 });
+app.get('/api/whoami', (req, res) => {
+  const session = verifyToken(parseCookies(req).auth);
+  res.json({ id: session ? session.id : null });
+});
 
-// Auth gate — everything below this needs a valid session unless APP_PASSWORD is unset (open/dev mode).
+// Auth gate — everything below this needs a valid session unless no login is configured (open/dev mode).
 app.use((req, res, next) => {
-  if (!APP_PASSWORD) return next(); // no password configured — app stays open
-  if (req.path === '/login' || req.path === '/login.html' || req.path === '/logout') return next();
+  if (!AUTH_REQUIRED) return next(); // no login configured — app stays open
+  if (req.path === '/login' || req.path === '/login.html' || req.path === '/logout' || req.path === '/api/whoami') return next();
   const cookies = parseCookies(req);
   if (verifyToken(cookies.auth)) return next();
   if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Not logged in. Please log in again.' });
@@ -403,7 +456,29 @@ function geminiText(data) {
 }
 
 // Extract structured line items (material, supplier, unit price) from pasted/PDF quotation text
-app.post('/api/extract', async (req, res) => {
+// ---------------- per-IP rate limit (fairness guard on the shared AI/search quota) ----------------
+// In-memory — fine for a single Render instance; resets on redeploy/restart, which is an acceptable tradeoff at this scale.
+const RATE_LIMIT_PER_HOUR = Number(process.env.RATE_LIMIT_PER_HOUR) || 20;
+const rateLimitBuckets = new Map(); // ip -> { count, windowStart }
+
+function rateLimit(req, res, next) {
+  const ip = (req.ip || 'unknown').replace('::ffff:', '');
+  const now = Date.now();
+  const windowMs = 60 * 60 * 1000;
+  let bucket = rateLimitBuckets.get(ip);
+  if (!bucket || now - bucket.windowStart > windowMs) {
+    bucket = { count: 0, windowStart: now };
+    rateLimitBuckets.set(ip, bucket);
+  }
+  bucket.count++;
+  if (bucket.count > RATE_LIMIT_PER_HOUR) {
+    const minutesLeft = Math.ceil((windowMs - (now - bucket.windowStart)) / 60000);
+    return res.status(429).json({ error: `You've hit this tool's per-user limit of ${RATE_LIMIT_PER_HOUR} AI searches per hour — this protects the shared quota for everyone else. Try again in about ${minutesLeft} minute(s).` });
+  }
+  next();
+}
+
+app.post('/api/extract', rateLimit, async (req, res) => {
   try {
     const { text, hint } = req.body || {};
     if (!text || !text.trim()) return res.status(400).json({ error: 'No text provided.' });
@@ -448,7 +523,7 @@ It may contain anywhere from 1 to 30+ line items — extract EVERY genuine item 
 });
 
 // Live market price + alternate supplier search for a single item (Google Search grounding)
-app.post('/api/market-check', async (req, res) => {
+app.post('/api/market-check', rateLimit, async (req, res) => {
   try {
     const { text, materialCode } = req.body || {};
     if (!text || !text.trim()) return res.status(400).json({ error: 'No item text provided.' });
