@@ -101,7 +101,10 @@
 <div class="wrap">
   <div class="row no-print" style="justify-content:space-between;margin-bottom:2px;">
     <h1 style="margin-bottom:0;">Quotation price analyzer</h1>
-    <a href="#" id="logoutLink" style="color:var(--text-faint);font-size:12px;">Log out</a>
+    <div class="row" style="gap:14px;">
+      <span id="whoamiLabel" style="color:var(--text-faint);font-size:12px;"></span>
+      <a href="#" id="logoutLink" style="color:var(--text-faint);font-size:12px;">Log out</a>
+    </div>
   </div>
   <p class="sub">Internal SAP purchase history first. External claims are never fabricated — no baseline means no verdict.</p>
 
@@ -1135,6 +1138,14 @@ function parseManualAIResponse(text){
   if(!priceFindings.length && !altSuppliers.length && !hsCodeFindings.length) throw new Error('No PRICE:/SUPPLIER:/HSCODE: lines recognized in that text.');
   return {priceFindings, altSuppliers, average, hsCodeFindings, provider:'manual'};
 }
+
+(async ()=>{
+  try{
+    const resp=await fetch('/api/whoami');
+    const data=await resp.json();
+    if(data.id) document.getElementById('whoamiLabel').textContent=`Logged in as ${data.id}`;
+  }catch(e){}
+})();
 
 document.getElementById('logoutLink').addEventListener('click', async e=>{
   e.preventDefault();
