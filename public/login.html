@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Sign in — Quotation Price Analyzer</title>
+<style>
+  :root{
+    --bg:#15171B; --panel:#1D2025; --panel-2:#242830; --line:#33383F;
+    --amber:#E8A23D; --text:#E7E8EA; --text-dim:#9AA0AB; --high:#C6564B;
+    --sans:'Inter',ui-sans-serif,system-ui,sans-serif;
+    --disp:'Space Grotesk',var(--sans);
+  }
+  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600&family=Inter:wght@400;500;600&display=swap');
+  *{box-sizing:border-box;}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);margin:0;min-height:100vh;
+    display:flex;align-items:center;justify-content:center;padding:24px;}
+  .box{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:32px;width:100%;max-width:340px;}
+  h1{font-family:var(--disp);font-weight:600;font-size:18px;margin:0 0 4px;}
+  p{color:var(--text-dim);font-size:13px;margin:0 0 20px;}
+  input{width:100%;font-size:14px;background:var(--panel-2);border:1px solid var(--line);color:var(--text);
+    border-radius:6px;padding:10px 12px;margin-bottom:12px;}
+  input:focus{outline:none;border-color:var(--amber);}
+  button{width:100%;font-size:14px;font-weight:500;background:var(--amber);color:#241a06;border:none;
+    border-radius:6px;padding:10px 12px;cursor:pointer;}
+  button:hover{background:#f0ac4c;}
+  .err{color:var(--high);font-size:12px;margin-top:10px;min-height:16px;}
+</style>
+</head>
+<body>
+  <div class="box">
+    <h1>Quotation Price Analyzer</h1>
+    <p>Enter your login ID and password to continue.</p>
+    <form id="loginForm">
+      <input type="text" id="loginId" placeholder="Login ID" autofocus autocomplete="username">
+      <input type="password" id="password" placeholder="Password" autocomplete="current-password">
+      <button type="submit">Sign in</button>
+      <div class="err" id="err"></div>
+    </form>
+  </div>
+<script>
+document.getElementById('loginForm').addEventListener('submit', async e=>{
+  e.preventDefault();
+  const err=document.getElementById('err');
+  err.textContent='';
+  try{
+    const resp=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({id:document.getElementById('loginId').value, password:document.getElementById('password').value})});
+    const data=await resp.json();
+    if(!resp.ok){ err.textContent=data.error||'Login failed.'; return; }
+    window.location.href='/';
+  }catch(e){
+    err.textContent='Could not reach the server. Try again.';
+  }
+});
+</script>
+</body>
+</html>
