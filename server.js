@@ -21,6 +21,7 @@ const AUTH_REQUIRED = !!APP_PASSWORD || Object.keys(APP_USERS).length > 0;
 const APP_EXPIRY = process.env.APP_EXPIRY;                   // optional, e.g. "2027-06-30" — access blocked after this date
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'); // set your own in production so sessions survive restarts
 const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const DEMO_SESSION_DURATION_MS = 8 * 60 * 1000; // 8 minutes — matches the free-demo timer on the main website
 
 function checkCredentials(id, password) {
   if (!id || !password) return false;
@@ -119,11 +120,20 @@ app.get('/api/whoami', (req, res) => {
 });
 
 // Auth gate — everything below this needs a valid session unless no login is configured (open/dev mode).
-app.use((req, res, next) => {
+app.use(async (req, res, next) => {
   if (!AUTH_REQUIRED) return next(); // no login configured — app stays open
   if (req.path === '/login' || req.path === '/login.html' || req.path === '/logout' || req.path === '/api/whoami') return next();
   const cookies = parseCookies(req);
   if (verifyToken(cookies.auth)) return next();
+
+  // Coming from the main website's "Try free demo" button (?mode=demo) with no session yet —
+  // grant a short demo session automatically, no password prompt, then continue to the app.
+  if (req.query.mode === 'demo' && !req.path.startsWith('/api/')) {
+    const token = sign(`${Date.now() + DEMO_SESSION_DURATION_MS}|demo`);
+    res.setHeader('Set-Cookie', `auth=${token}; HttpOnly; Path=/; Max-Age=${DEMO_SESSION_DURATION_MS / 1000}; SameSite=Lax`);
+    return next();
+  }
+
   if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Not logged in. Please log in again.' });
   return res.redirect('/login.html');
 });
