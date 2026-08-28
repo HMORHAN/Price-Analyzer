@@ -406,6 +406,7 @@ document.getElementById('xlsxFile').addEventListener('change', async e=>{
     el.className='status';
     el.textContent+=` (${errors.length} file(s) had issues: ${errors.join(' | ')})`;
   }
+  e.target.value=''; // allow re-selecting the same filename later — some browsers won't fire "change" otherwise
 });
 
 // ---------------- Pakistan Customs data (flexible column mapping) ----------------
@@ -434,6 +435,7 @@ document.getElementById('customsFile').addEventListener('change', async e=>{
   }catch(e){
     status.textContent='Could not read one or more files as Excel workbooks. ('+e.message+')';
   }
+  e.target.value=''; // allow re-selecting the same filename later — some browsers won't fire "change" otherwise
 });
 
 function renderCustomsMapping(headers, fileCount){
