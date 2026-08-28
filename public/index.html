@@ -111,15 +111,18 @@
   <section class="no-print">
     <h2><span class="step-num">1</span> Load purchase history</h2>
     <div class="row">
-      <input type="file" id="xlsxFile" accept=".xlsx,.xls">
+      <input type="file" id="xlsxFile" accept=".xlsx,.xls" multiple>
       <button id="loadStoredBtn" class="ghost">Use last loaded file</button>
+      <button id="clearHistoryBtn" class="ghost">Clear loaded history</button>
+      <span class="note">Select multiple files at once to load them all together (e.g. several months of SAP exports).</span>
     </div>
     <div class="status" id="loadStatus">No history loaded yet.</div>
 
     <div class="row" style="margin-top:16px;">
-      <input type="file" id="customsFile" accept=".xlsx,.xls">
+      <input type="file" id="customsFile" accept=".xlsx,.xls" multiple>
       <button id="loadStoredCustomsBtn" class="ghost">Use last loaded file</button>
-      <span class="note">Optional — Pakistan Customs import data (any column layout). Compared against SAP history + current quoted price per item below.</span>
+      <button id="clearCustomsBtn" class="ghost">Clear customs data</button>
+      <span class="note">Optional — Pakistan Customs import data (any column layout, select multiple files at once if needed). Compared against SAP history + current quoted price per item below.</span>
     </div>
     <div class="status" id="customsStatus">No customs data loaded yet.</div>
     <div id="customsMapping" style="display:none;margin-top:10px;"></div>
@@ -247,6 +250,34 @@ function verdictLabel(result, thresholdPct){
 let HISTORY=[];
 let ITEMS=[];
 let CUSTOMS=[];
+let marketSummaryData={}; // idx -> {itemText, average, topManufacturer, hsCode}
+
+function updateMarketSummary(idx, item, data){
+  const topMfr=(data.altSuppliers||[]).find(s=>(s.type||'').toLowerCase()==='manufacturer');
+  const topHs=(data.hsCodeFindings||[])[0];
+  marketSummaryData[idx]={
+    itemText: item.text,
+    average: data.average ? `${fmtPrice(data.average.value)} ${data.average.currency}` : '—',
+    topSupplier: topMfr ? topMfr.company : ((data.altSuppliers||[])[0]?(data.altSuppliers[0].company+' ('+(data.altSuppliers[0].type||'')+')'):'—'),
+    hsCode: topHs ? topHs.code : '—'
+  };
+  renderMarketSummaryTable();
+}
+
+function renderMarketSummaryTable(){
+  const wrap=document.getElementById('marketSummaryWrap');
+  if(!wrap) return;
+  const rows=Object.values(marketSummaryData);
+  if(!rows.length){ wrap.innerHTML=''; return; }
+  let html='<div class="sec-label" style="margin-top:0;">Market search summary — all searched items</div>';
+  html+='<table><thead><tr><th>Item</th><th class="num">Avg market price</th><th>Top supplier found</th><th>HS code</th></tr></thead><tbody>';
+  rows.forEach(r=>{
+    html+=`<tr><td>${escapeHtml(r.itemText)}</td><td class="num">${escapeHtml(r.average)}</td><td>${escapeHtml(r.topSupplier)}</td><td>${escapeHtml(r.hsCode)}</td></tr>`;
+  });
+  html+='</tbody></table>';
+  wrap.innerHTML=html;
+}
+
 
 function fmtPrice(n){return Number(n).toLocaleString(undefined,{maximumFractionDigits:2});}
 function escapeHtml(s){return (s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
@@ -274,14 +305,13 @@ async function marketCheckItem(text, materialCode){
 }
 
 // ---------------- history loading ----------------
-function parseWorkbook(ab){
+function parseWorkbookRecords(ab, filename){
   const wb=XLSX.read(ab,{type:'array',cellDates:true});
   const sheetName=wb.SheetNames.includes('Data')?'Data':wb.SheetNames[0];
   const ws=wb.Sheets[sheetName];
   const allRows=XLSX.utils.sheet_to_json(ws,{header:1,raw:true,defval:null});
   if(!allRows.length){
-    document.getElementById('loadStatus').textContent='Could not read any rows from this file.';
-    return;
+    throw new Error(`${filename}: could not read any rows.`);
   }
 
   // Find the real header row by scanning the first several rows for one containing the two
@@ -297,8 +327,7 @@ function parseWorkbook(ab){
     }
   }
   if(headerRowIdx===-1){
-    document.getElementById('loadStatus').textContent='Could not find a header row containing "Short Text" and "Net Price" in the first 10 rows of the "'+sheetName+'" tab. Check the file layout.';
-    return;
+    throw new Error(`${filename}: could not find a header row containing "Short Text" and "Net Price" in the first 10 rows of the "${sheetName}" tab.`);
   }
 
   function firstIdx(name){
@@ -314,8 +343,7 @@ function parseWorkbook(ab){
   if(idx.text===-1) missing.push('Short Text (material name)');
   if(idx.price===-1) missing.push('Net Price (unit price)');
   if(missing.length){
-    document.getElementById('loadStatus').textContent='Missing required column(s): '+missing.join(', ')+'. Check the "'+sheetName+'" tab headers.';
-    return;
+    throw new Error(`${filename}: missing required column(s): ${missing.join(', ')}.`);
   }
   const out=[];
   for(let i=headerRowIdx+1;i<allRows.length;i++){
@@ -337,51 +365,78 @@ function parseWorkbook(ab){
       segment: idx.segment>=0 ? (r[idx.segment]||'') : ''
     });
   }
-  HISTORY=out;
-  const el=document.getElementById('loadStatus');
-  el.className='status good';
-  const materials=new Set(out.map(r=>r.material));
-  const dates=out.map(r=>r.date).filter(Boolean).sort();
-  el.textContent=`Loaded ${out.length} purchase records, ${materials.size} distinct materials. Date range ${dates[0]||'—'} to ${dates[dates.length-1]||'—'}.`;
-  try{
-    localStorage.setItem('sap-history-data', JSON.stringify(out));
-  }catch(e){}
+  return out;
 }
 
-document.getElementById('xlsxFile').addEventListener('change', e=>{
-  const f=e.target.files[0]; if(!f) return;
-  const reader=new FileReader();
-  reader.onload=ev=>parseWorkbook(ev.target.result);
-  reader.readAsArrayBuffer(f);
+function persistHistory(){
+  const el=document.getElementById('loadStatus');
+  el.className='status good';
+  const materials=new Set(HISTORY.map(r=>r.material));
+  const dates=HISTORY.map(r=>r.date).filter(Boolean).sort();
+  el.textContent=`Loaded ${HISTORY.length} purchase records, ${materials.size} distinct materials. Date range ${dates[0]||'—'} to ${dates[dates.length-1]||'—'}.`;
+  try{ localStorage.setItem('sap-history-data', JSON.stringify(HISTORY)); }catch(e){}
+}
+
+document.getElementById('clearHistoryBtn').addEventListener('click', ()=>{
+  HISTORY=[];
+  try{ localStorage.removeItem('sap-history-data'); }catch(e){}
+  const el=document.getElementById('loadStatus');
+  el.className='status';
+  el.textContent='History cleared. Upload a file to load purchase history.';
+});
+
+document.getElementById('xlsxFile').addEventListener('change', async e=>{
+  const files=Array.from(e.target.files); if(!files.length) return;
+  const el=document.getElementById('loadStatus');
+  el.textContent=`Reading ${files.length} file(s)…`;
+  const errors=[];
+  let addedCount=0;
+  for(const f of files){
+    try{
+      const ab=await f.arrayBuffer();
+      const recs=parseWorkbookRecords(ab, f.name);
+      HISTORY=HISTORY.concat(recs);
+      addedCount+=recs.length;
+    }catch(err){
+      errors.push(err.message);
+    }
+  }
+  persistHistory();
+  if(errors.length){
+    el.className='status';
+    el.textContent+=` (${errors.length} file(s) had issues: ${errors.join(' | ')})`;
+  }
 });
 
 // ---------------- Pakistan Customs data (flexible column mapping) ----------------
-let __customsRawRows=null;
+let __customsFileSets=null; // array of {name, rows} — one per uploaded file, merged on confirm
 
-document.getElementById('customsFile').addEventListener('change', e=>{
-  const f=e.target.files[0]; if(!f) return;
-  const reader=new FileReader();
-  reader.onload=ev=>parseCustomsWorkbook(ev.target.result);
-  reader.readAsArrayBuffer(f);
+document.getElementById('customsFile').addEventListener('change', async e=>{
+  const files=Array.from(e.target.files); if(!files.length) return;
+  const status=document.getElementById('customsStatus');
+  status.textContent=`Reading ${files.length} file(s)…`;
+  try{
+    const sets=[];
+    for(const f of files){
+      const ab=await f.arrayBuffer();
+      const wb=XLSX.read(ab,{type:'array',cellDates:true});
+      const ws=wb.Sheets[wb.SheetNames[0]];
+      const rows=XLSX.utils.sheet_to_json(ws,{header:1,raw:true,defval:null});
+      if(rows.length) sets.push({name:f.name, rows});
+    }
+    if(!sets.length){ status.textContent='Could not read any rows from the selected file(s).'; return; }
+    __customsFileSets=sets;
+    // Use the first file's headers for the mapping UI — remaining files are expected to share the same layout.
+    const headers=sets[0].rows[0].map((h,i)=>h==null||h===''?'Column '+(i+1):String(h));
+    renderCustomsMapping(headers, sets.length);
+    const totalRows=sets.reduce((a,s)=>a+s.rows.length-1,0);
+    status.textContent=`Found ${totalRows} row(s) across ${sets.length} file(s), ${headers.length} column(s) — map the columns below, then click "Load customs data".${sets.length>1?' (Assuming all files share the same column layout as the first.)':''}`;
+  }catch(e){
+    status.textContent='Could not read one or more files as Excel workbooks. ('+e.message+')';
+  }
 });
 
-function parseCustomsWorkbook(ab){
-  const status=document.getElementById('customsStatus');
-  try{
-    const wb=XLSX.read(ab,{type:'array',cellDates:true});
-    const ws=wb.Sheets[wb.SheetNames[0]];
-    const rows=XLSX.utils.sheet_to_json(ws,{header:1,raw:true,defval:null});
-    if(!rows.length){ status.textContent='Could not read any rows from this file.'; return; }
-    __customsRawRows=rows;
-    const headers=rows[0].map((h,i)=>h==null||h===''?'Column '+(i+1):String(h));
-    renderCustomsMapping(headers);
-    status.textContent=`Found ${rows.length-1} row(s), ${headers.length} column(s) — map the columns below, then click "Load customs data".`;
-  }catch(e){
-    status.textContent='Could not read this file as an Excel workbook. ('+e.message+')';
-  }
-}
-
-function renderCustomsMapping(headers){
+function renderCustomsMapping(headers, fileCount){
   const wrap=document.getElementById('customsMapping');
   wrap.style.display='block';
   const fields=[
@@ -389,9 +444,10 @@ function renderCustomsMapping(headers){
     {key:'hsCode',label:'HS code column (optional)',required:false},
     {key:'price',label:'Unit price column',required:true},
     {key:'currency',label:'Currency column (optional)',required:false},
+    {key:'region',label:'Region/country column (optional)',required:false},
     {key:'date',label:'Date column (optional)',required:false}
   ];
-  let html='<div class="sec-label" style="margin-top:0;">Map your customs file columns</div><div class="item-form">';
+  let html='<div class="sec-label" style="margin-top:0;">Map your customs file columns'+(fileCount>1?` (applied to all ${fileCount} files)`:'')+'</div><div class="item-form">';
   fields.forEach(f=>{
     html+=`<div class="field"><label>${escapeHtml(f.label)}</label><select id="map-${f.key}">`;
     html+=`<option value="-1">${f.required?'— select —':'(none)'}</option>`;
@@ -405,36 +461,51 @@ function renderCustomsMapping(headers){
 
 function confirmCustomsMapping(){
   const status=document.getElementById('customsStatus');
-  const rows=__customsRawRows;
-  if(!rows){ status.textContent='Upload a customs file first.'; return; }
+  const sets=__customsFileSets;
+  if(!sets){ status.textContent='Upload a customs file first.'; return; }
   const idx=k=>Number(document.getElementById('map-'+k).value);
-  const dIdx=idx('description'), pIdx=idx('price'), hIdx=idx('hsCode'), cIdx=idx('currency'), dtIdx=idx('date');
+  const dIdx=idx('description'), pIdx=idx('price'), hIdx=idx('hsCode'), cIdx=idx('currency'), rIdx=idx('region'), dtIdx=idx('date');
   if(dIdx<0 || pIdx<0){ alert('Item description column and Unit price column are both required.'); return; }
   const out=[];
-  for(let i=1;i<rows.length;i++){
-    const r=rows[i]; if(!r) continue;
-    const desc=r[dIdx]; const price=Number(r[pIdx]);
-    if(!desc || isNaN(price)) continue;
-    let dateStr='';
-    if(dtIdx>=0 && r[dtIdx]!=null){
-      const d=r[dtIdx];
-      dateStr = d instanceof Date ? d.toISOString().slice(0,10) : String(d).slice(0,10);
+  sets.forEach(set=>{
+    const rows=set.rows;
+    for(let i=1;i<rows.length;i++){
+      const r=rows[i]; if(!r) continue;
+      const desc=r[dIdx]; const price=Number(r[pIdx]);
+      if(!desc || isNaN(price)) continue;
+      let dateStr='';
+      if(dtIdx>=0 && r[dtIdx]!=null){
+        const d=r[dtIdx];
+        dateStr = d instanceof Date ? d.toISOString().slice(0,10) : String(d).slice(0,10);
+      }
+      out.push({
+        description:String(desc),
+        hsCode: hIdx>=0 && r[hIdx]!=null ? String(r[hIdx]) : '',
+        price,
+        currency: cIdx>=0 && r[cIdx]!=null ? String(r[cIdx]) : '',
+        region: rIdx>=0 && r[rIdx]!=null ? String(r[rIdx]) : '',
+        date: dateStr,
+        sourceFile: set.name
+      });
     }
-    out.push({
-      description:String(desc),
-      hsCode: hIdx>=0 && r[hIdx]!=null ? String(r[hIdx]) : '',
-      price,
-      currency: cIdx>=0 && r[cIdx]!=null ? String(r[cIdx]) : '',
-      date: dateStr
-    });
-  }
+  });
   if(!out.length){ status.textContent='No usable rows found — check the description and price column selections.'; return; }
-  CUSTOMS=out;
-  try{ localStorage.setItem('pk-customs-data', JSON.stringify(out)); }catch(e){}
+  CUSTOMS=CUSTOMS.concat(out);
+  try{ localStorage.setItem('pk-customs-data', JSON.stringify(CUSTOMS)); }catch(e){}
   status.className='status good';
-  status.textContent=`Loaded ${out.length} customs record(s).`;
+  status.textContent=`Loaded ${out.length} customs record(s) (${CUSTOMS.length} total loaded).`;
   document.getElementById('customsMapping').style.display='none';
 }
+
+document.getElementById('clearCustomsBtn').addEventListener('click', ()=>{
+  CUSTOMS=[];
+  __customsFileSets=null;
+  try{ localStorage.removeItem('pk-customs-data'); }catch(e){}
+  const el=document.getElementById('customsStatus');
+  el.className='status';
+  el.textContent='Customs data cleared. Upload file(s) to reload.';
+  document.getElementById('customsMapping').style.display='none';
+});
 
 function bestCustomsMatch(item){
   if(!CUSTOMS.length) return null;
@@ -637,6 +708,7 @@ document.getElementById('saveResultsBtn').addEventListener('click', ()=>{
 document.getElementById('analyzeBtn').addEventListener('click', ()=>{
   const results=document.getElementById('results');
   results.innerHTML='';
+  marketSummaryData={};
   if(!HISTORY.length){
     results.innerHTML='<div class="warn-box">Load purchase history first — no baseline to compare against.</div>';
     return;
@@ -647,6 +719,7 @@ document.getElementById('analyzeBtn').addEventListener('click', ()=>{
   }
   const threshold=Number(document.getElementById('threshold').value);
   const counts={ok:0,high:0,low:0,noBaseline:0};
+  const overviewRows=[];
   ITEMS.forEach((item,idx)=>{
     const res=buildAnalysis(item,HISTORY);
     const verdict=verdictLabel(res,threshold);
@@ -655,6 +728,7 @@ document.getElementById('analyzeBtn').addEventListener('click', ()=>{
     else if(verdict.className==='flag-high') counts.high++;
     else if(verdict.className==='flag-low') counts.low++;
     else counts.ok++;
+    overviewRows.push({item, res, verdict, cm: CUSTOMS.length?bestCustomsMatch(item):null});
 
     const card=document.createElement('div');
     card.className='card';
@@ -706,10 +780,10 @@ document.getElementById('analyzeBtn').addEventListener('click', ()=>{
     } else {
       const cm=bestCustomsMatch(item);
       if(cm || res.stats){
-        html+='<table><thead><tr><th></th><th class="num">Price</th><th>Ccy</th><th>Source / date</th></tr></thead><tbody>';
-        html+=`<tr><td>Last SAP purchase</td><td class="num">${res.stats?fmtPrice(res.stats.latestPrice):'—'}</td><td>${res.stats?res.stats.currency:'—'}</td><td>${res.stats?res.stats.latestDate:'no internal record'}</td></tr>`;
-        html+=`<tr><td>Customs record (matched)</td><td class="num">${cm?fmtPrice(cm.price):'—'}</td><td>${cm?(cm.currency||'—'):'—'}</td><td>${cm?(cm.date||'—')+(cm.hsCode?' · HS '+escapeHtml(cm.hsCode):''):'no match found'}</td></tr>`;
-        html+=`<tr><td>Current quoted price</td><td class="num">${fmtPrice(item.price)}</td><td>${item.currency}</td><td>this quotation</td></tr>`;
+        html+='<table><thead><tr><th></th><th class="num">Price</th><th>Ccy</th><th>Region</th><th>Source / date</th></tr></thead><tbody>';
+        html+=`<tr><td>Last SAP purchase</td><td class="num">${res.stats?fmtPrice(res.stats.latestPrice):'—'}</td><td>${res.stats?res.stats.currency:'—'}</td><td>—</td><td>${res.stats?res.stats.latestDate:'no internal record'}</td></tr>`;
+        html+=`<tr><td>Customs record (matched)</td><td class="num">${cm?fmtPrice(cm.price):'—'}</td><td>${cm?(cm.currency||'—'):'—'}</td><td>${cm?(cm.region||'—'):'—'}</td><td>${cm?(cm.date||'—')+(cm.hsCode?' · HS '+escapeHtml(cm.hsCode):''):'no match found'}</td></tr>`;
+        html+=`<tr><td>Current quoted price</td><td class="num">${fmtPrice(item.price)}</td><td>${item.currency}</td><td>—</td><td>this quotation</td></tr>`;
         html+='</tbody></table>';
         if(cm) html+=`<div class="note">Customs match: "${escapeHtml(cm.description)}" (text similarity ${(cm.score*100).toFixed(0)}%) — verify this is genuinely the same item before relying on it.</div>`;
       } else {
@@ -743,6 +817,22 @@ document.getElementById('analyzeBtn').addEventListener('click', ()=>{
     <div class="stat"><div class="l" style="color:var(--none);">No baseline</div><div class="v" style="color:var(--none);">${counts.noBaseline}</div></div>`;
   results.prepend(dash);
 
+  const overviewCard=document.createElement('div');
+  overviewCard.className='card';
+  let ovHtml='<div class="sec-label" style="margin-top:0;">All items — purchase history vs customs vs quoted price</div>';
+  ovHtml+='<table><thead><tr><th>Item</th><th>Material</th><th class="num">Last SAP price</th><th class="num">Customs price</th><th class="num">Quoted price</th><th>Verdict</th></tr></thead><tbody>';
+  overviewRows.forEach(({item,res,verdict,cm})=>{
+    const vClass=verdict.className==='flag-high'?'high':verdict.className==='flag-low'?'low':verdict.className==='flag-none'?'none':'ok';
+    ovHtml+=`<tr><td>${escapeHtml(item.text)}</td><td class="num">${escapeHtml(item.materialCode||'—')}</td>`+
+      `<td class="num">${res.stats?fmtPrice(res.stats.latestPrice)+' '+res.stats.currency:'—'}</td>`+
+      `<td class="num">${cm?fmtPrice(cm.price)+' '+(cm.currency||''):'—'}</td>`+
+      `<td class="num">${fmtPrice(item.price)} ${item.currency}</td>`+
+      `<td><span class="badge ${vClass==='high'?'weak':vClass==='low'?'weak':vClass==='none'?'none':'certain'}">${escapeHtml(verdict.label)}</span></td></tr>`;
+  });
+  ovHtml+='</tbody></table>';
+  overviewCard.innerHTML=ovHtml;
+  results.insertBefore(overviewCard, dash.nextSibling);
+
   const batchBar=document.createElement('div');
   batchBar.className='row';
   batchBar.style.marginBottom='16px';
@@ -750,8 +840,9 @@ document.getElementById('analyzeBtn').addEventListener('click', ()=>{
     <button class="ghost" id="batchSearchBtn">Search live market price — all items</button>
     <button class="ghost" id="batchManualBtn">Copy prompt for manual AI search — all items (unlimited)</button>
     <span class="status" id="batchStatus"></span>
-    <div id="batchManualBox" style="display:none;width:100%;margin-top:8px;"></div>`;
-  results.insertBefore(batchBar, dash.nextSibling);
+    <div id="batchManualBox" style="display:none;width:100%;margin-top:8px;"></div>
+    <div id="marketSummaryWrap" style="width:100%;margin-top:12px;"></div>`;
+  results.insertBefore(batchBar, overviewCard.nextSibling);
 
   document.getElementById('batchSearchBtn').addEventListener('click', async ()=>{
     const btn=document.getElementById('batchSearchBtn');
@@ -907,6 +998,8 @@ async function checkMarketPrice(item, container, btn){
     const data=await marketCheckItem(item.text, item.materialCode);
     container.innerHTML=renderMarketCheck(data);
     attachRFQHandlers(container, data.altSuppliers, item);
+    const idx=Number((container.id||'').replace('mc-',''));
+    if(!isNaN(idx)) updateMarketSummary(idx, item, data);
   }catch(e){
     container.innerHTML=`<div class="warn-box">External check failed: ${escapeHtml(e.message)}</div>`;
   }finally{
@@ -978,6 +1071,7 @@ function renderBatchManualPasteBox(box, copiedOk, fallbackPromptText, items){
         if(!container) return;
         container.innerHTML=renderMarketCheck(data);
         attachRFQHandlers(container, data.altSuppliers, items[i]);
+        updateMarketSummary(i, items[i], data);
         filled++;
       });
       status.className='status good';
@@ -1093,6 +1187,8 @@ function renderManualPasteBox(container, copiedOk, fallbackPromptText, item){
       const data=parseManualAIResponse(text);
       resultEl.innerHTML=renderMarketCheck(data);
       attachRFQHandlers(resultEl, data.altSuppliers, item);
+      const idx=Number((container.id||'').replace('manual-',''));
+      if(!isNaN(idx)) updateMarketSummary(idx, item, data);
     }catch(e){
       resultEl.innerHTML=`<div class="warn-box">Could not parse that reply — make sure the AI followed the PRICE:/SUPPLIER:/HSCODE: line format. (${escapeHtml(e.message)})</div>`;
     }
