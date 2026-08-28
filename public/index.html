@@ -111,7 +111,7 @@
   <section class="no-print">
     <h2><span class="step-num">1</span> Load purchase history</h2>
     <div class="row">
-      <input type="file" id="xlsxFile" accept=".xlsx,.xls" multiple>
+      <input type="file" id="xlsxFile" accept=".xlsx,.xls,.xlsm,.csv" multiple>
       <button id="loadStoredBtn" class="ghost">Use last loaded file</button>
       <button id="clearHistoryBtn" class="ghost">Clear loaded history</button>
       <span class="note">Select multiple files at once to load them all together (e.g. several months of SAP exports).</span>
@@ -119,7 +119,7 @@
     <div class="status" id="loadStatus">No history loaded yet.</div>
 
     <div class="row" style="margin-top:16px;">
-      <input type="file" id="customsFile" accept=".xlsx,.xls" multiple>
+      <input type="file" id="customsFile" accept=".xlsx,.xls,.xlsm,.csv" multiple>
       <button id="loadStoredCustomsBtn" class="ghost">Use last loaded file</button>
       <button id="clearCustomsBtn" class="ghost">Clear customs data</button>
       <span class="note">Optional — Pakistan Customs import data (any column layout, select multiple files at once if needed). Compared against SAP history + current quoted price per item below.</span>
