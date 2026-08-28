@@ -378,6 +378,8 @@ function persistHistory(){
 }
 
 document.getElementById('clearHistoryBtn').addEventListener('click', ()=>{
+  if(!HISTORY.length){ return; }
+  if(!confirm(`Clear all ${HISTORY.length} loaded purchase history record(s)? This cannot be undone.`)) return;
   HISTORY=[];
   try{ localStorage.removeItem('sap-history-data'); }catch(e){}
   const el=document.getElementById('loadStatus');
@@ -500,6 +502,8 @@ function confirmCustomsMapping(){
 }
 
 document.getElementById('clearCustomsBtn').addEventListener('click', ()=>{
+  if(!CUSTOMS.length){ return; }
+  if(!confirm(`Clear all ${CUSTOMS.length} loaded customs record(s)? This cannot be undone.`)) return;
   CUSTOMS=[];
   __customsFileSets=null;
   try{ localStorage.removeItem('pk-customs-data'); }catch(e){}
@@ -711,13 +715,12 @@ document.getElementById('analyzeBtn').addEventListener('click', ()=>{
   const results=document.getElementById('results');
   results.innerHTML='';
   marketSummaryData={};
-  if(!HISTORY.length){
-    results.innerHTML='<div class="warn-box">Load purchase history first — no baseline to compare against.</div>';
-    return;
-  }
   if(!ITEMS.length){
     results.innerHTML='<div class="warn-box">Add at least one quotation item first.</div>';
     return;
+  }
+  if(!HISTORY.length){
+    results.innerHTML='<div class="note" style="margin-bottom:12px;">No purchase history loaded — every item below will show "No internal baseline" until you upload SAP history in Section 1. Quoted prices and any customs/market comparisons still work.</div>';
   }
   const threshold=Number(document.getElementById('threshold').value);
   const counts={ok:0,high:0,low:0,noBaseline:0};
