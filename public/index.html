@@ -494,10 +494,28 @@ function confirmCustomsMapping(){
     }
   });
   if(!out.length){ status.textContent='No usable rows found — check the description and price column selections.'; return; }
-  CUSTOMS=CUSTOMS.concat(out);
-  try{ localStorage.setItem('pk-customs-data', JSON.stringify(CUSTOMS)); }catch(e){}
+
+  // Keep only the most recent record per unique item description — a raw customs GD file can have
+  // tens of thousands of individual shipment line-items for the same product; for a price comparison,
+  // the latest one is the useful signal, and this also keeps the dataset well under the browser's storage limit.
+  const byDesc=new Map();
+  out.forEach(r=>{
+    const key=r.description.trim().toLowerCase();
+    const existing=byDesc.get(key);
+    if(!existing || (r.date && r.date>(existing.date||''))) byDesc.set(key, r);
+  });
+  const deduped=Array.from(byDesc.values());
+
+  CUSTOMS=CUSTOMS.concat(deduped);
+  let saveWarning='';
+  try{
+    localStorage.setItem('pk-customs-data', JSON.stringify(CUSTOMS));
+  }catch(e){
+    saveWarning=' Note: this dataset is too large to save in your browser for next time — it will need re-uploading each session, but it works fully for this session.';
+  }
   status.className='status good';
-  status.textContent=`Loaded ${out.length} customs record(s) (${CUSTOMS.length} total loaded).`;
+  const sample=deduped.slice(0,3).map(r=>`"${r.description.slice(0,40)}" → ${r.price} ${r.currency}`).join('; ');
+  status.innerHTML=`Loaded ${out.length} raw row(s), reduced to ${deduped.length} unique item(s) after keeping the latest per description (${CUSTOMS.length} total loaded).${saveWarning}<br><span style="color:var(--text-faint);">Sample of what was loaded — check this matches your file: ${escapeHtml(sample)}</span>`;
   document.getElementById('customsMapping').style.display='none';
 }
 
